@@ -1,0 +1,26 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+*.log
+
+# Local deployment and credentials
+docker-compose.local.yml
+docker-compose.remote.yml
+keys.json
+*-keys.json
+*.pem
+*.key
+
+# Generated test artifacts containing local URLs or test secrets
+AITube-PLLM-Apifox.postman_collection.json
+AITube-PLLM-Apifox.openapi.json
+apifox-test-image*
+API_TEST_CASES.md
+API_TEST_REPORT.md
+run_api_tests.py
