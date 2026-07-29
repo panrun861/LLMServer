@@ -22,6 +22,10 @@ class SignatureVerificationMiddleware(BaseHTTPMiddleware):
         if not request.url.path.startswith("/admin/"):
             return await call_next(request)
 
+        # 仪表盘只读接口使用专用 token 认证，跳过 Ed25519 签名
+        if request.url.path.startswith("/admin/dashboard"):
+            return await call_next(request)
+
         # 跳过 localhost CLI 端点（模型管理使用 x-local-admin 认证）
         if request.url.path.startswith("/admin/models") and request.headers.get("x-local-admin") == "true":
             return await call_next(request)

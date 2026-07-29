@@ -12,6 +12,7 @@ from .api.token_management import router as token_router
 from .api.model_management import router as model_router
 from .api.usage_and_audit import router as usage_audit_router
 from .api.inference_gateway import router as inference_router
+from .api.dashboard import router as dashboard_router
 
 
 @asynccontextmanager
@@ -48,6 +49,7 @@ def create_app() -> FastAPI:
     app.include_router(model_router)
     app.include_router(usage_audit_router)
     app.include_router(inference_router)
+    app.include_router(dashboard_router)
     
     # 健康检查端点
     @app.get("/health")
