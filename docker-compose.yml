@@ -8,6 +8,21 @@ services:
       - "${PLLM_PORT:-8080}:8080"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # 系统资源监控挂载（只读）：主机 /proc、根文件系统、Docker socket
+    volumes:
+      - /proc:/host/proc:ro
+      - /:/hostfs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # 授权 GPU 设备，使容器内可运行 nvidia-smi 采集 GPU 指标
+    environment:
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
 
   postgres:
     image: postgres:16

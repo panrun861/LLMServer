@@ -46,6 +46,12 @@ class Settings(BaseSettings):
         description="默认速率限制(每分钟请求数), None 表示无限制",
     )
 
+    # 仪表盘只读接口 token（用于外部前端拉取监控聚合数据）
+    dashboard_token: str = Field(
+        default="",
+        description="只读仪表盘 token，配合 Authorization: Bearer 或 X-Dashboard-Token 使用",
+    )
+
     # 缓存配置
     models_cache_ttl: int = Field(
         default=30,
