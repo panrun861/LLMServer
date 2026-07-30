@@ -395,6 +395,102 @@ async def collect_inference_metrics() -> dict:
     return result
 
 
+async def collect_postgres_metrics() -> dict:
+    """采集 Postgres 实例运行指标（连接数 / TPS / 缓存命中 / 库大小 / 健康计数）。
+
+    数据源：Prometheus 中的 postgres-exporter（job=postgres）。
+    若 Prometheus 不可达，回退到直连业务库 db.pool（仅当前连接库，指标较少但看板不空）。
+    """
+    result = {
+        "available": False,
+        "source": "prometheus",
+        "error": None,
+        "up": None,
+        "is_replica": None,
+        "total_connections": None,
+        "active_connections": None,
+        "commits_per_sec": None,
+        "rollbacks_per_sec": None,
+        "cache_hit_ratio": None,
+        "db_sizes": [],        # [{datname, bytes}]
+        "deadlocks": None,
+        "conflicts": None,
+        "temp_files": None,
+    }
+    try:
+        up = await _prom_query("pg_up")
+        if not up:
+            raise RuntimeError("postgres-exporter 无数据")
+        result["up"] = int(float(up[0]["value"][1])) == 1
+
+        nb = await _prom_query("sum(pg_stat_database_numbackends)")
+        if nb:
+            result["total_connections"] = int(float(nb[0]["value"][1]))
+
+        act = await _prom_query('sum(pg_stat_activity_count{state="active"})')
+        if act:
+            result["active_connections"] = int(float(act[0]["value"][1]))
+
+        com = await _prom_query("sum(rate(pg_stat_database_xact_commit[5m]))")
+        if com:
+            result["commits_per_sec"] = round(float(com[0]["value"][1]), 2)
+
+        rb = await _prom_query("sum(rate(pg_stat_database_xact_rollback[5m]))")
+        if rb:
+            result["rollbacks_per_sec"] = round(float(rb[0]["value"][1]), 2)
+
+        hit = await _prom_query("sum(pg_stat_database_blks_hit)")
+        rd = await _prom_query("sum(pg_stat_database_blks_read)")
+        if hit and rd:
+            h = float(hit[0]["value"][1])
+            r = float(rd[0]["value"][1])
+            result["cache_hit_ratio"] = round(h / (h + r), 4) if (h + r) > 0 else None
+
+        sz = await _prom_query("pg_database_size_bytes")
+        if sz:
+            result["db_sizes"] = [
+                {"datname": i["metric"].get("datname"), "bytes": int(float(i["value"][1]))}
+                for i in sz
+            ]
+
+        for key, expr in (
+            ("deadlocks", "sum(pg_stat_database_deadlocks)"),
+            ("conflicts", "sum(pg_stat_database_conflicts)"),
+            ("temp_files", "sum(pg_stat_database_temp_files)"),
+        ):
+            r = await _prom_query(expr)
+            if r:
+                result[key] = int(float(r[0]["value"][1]))
+
+        rep = await _prom_query("pg_replication_is_replica")
+        if rep:
+            result["is_replica"] = int(float(rep[0]["value"][1])) == 1
+
+        result["available"] = True
+        return result
+    except Exception:  # noqa: BLE001
+        # 兜底：直连业务库（仅当前连接库，指标有限）
+        try:
+            async with db.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT count(*) AS conns FROM pg_stat_activity"
+                )
+                size = await conn.fetch(
+                    "SELECT datname, pg_database_size(datname) AS bytes FROM pg_database"
+                )
+            result.update({
+                "available": True,
+                "source": "db_direct",
+                "up": True,
+                "total_connections": int(row["conns"]) if row else None,
+                "db_sizes": [{"datname": r["datname"], "bytes": int(r["bytes"])} for r in (size or [])],
+            })
+            return result
+        except Exception as e2:  # noqa: BLE001
+            result["error"] = str(e2)[:120]
+            return result
+
+
 # ========== 业务聚合查询（全量明细） ==========
 
 async def build_snapshot(window_hours: int = 24) -> dict:
@@ -584,10 +680,11 @@ async def build_snapshot(window_hours: int = 24) -> dict:
     ]
 
     # 系统资源（主机/容器/GPU）、推理并发、litellm 连通性 一并并发采集，缩短总耗时
-    system, inference, litellm_reachable = await asyncio.gather(
+    system, inference, litellm_reachable, database = await asyncio.gather(
         collect_system_metrics(),
         collect_inference_metrics(),
         _check_litellm(),
+        collect_postgres_metrics(),
     )
 
     return {
@@ -640,6 +737,7 @@ async def build_snapshot(window_hours: int = 24) -> dict:
         ],
         "system": system,
         "inference": inference,
+        "database": database,
         "keys": {
             "active": int(keys["active"]) if keys else 0,
             "total": int(keys["total"]) if keys else 0,
@@ -1214,6 +1312,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="row">
     <div class="panel"><h2>KV Cache 缓存 (vLLM)</h2><div id="kvcache"></div></div>
   </div>
+  <div class="row">
+    <div class="panel"><h2>数据库实例 (Postgres · Prometheus)</h2><div id="database"></div></div>
+  </div>
   <div class="panel"><h2>容器资源</h2><div class="tblscroll"><table id="tblContainers"></table></div></div>
   <div class="panel"><h2>模型登记</h2><div id="models"></div></div>
 </div>
@@ -1249,6 +1350,7 @@ document.querySelectorAll("#winbtns button").forEach(b => {
 // 实时推送由 EventSource(connect) 驱动，不再使用轮询 load()
 
 function fmt(n){ return (n==null?0:n).toLocaleString(); }
+function fmtBytes(n){ if(n==null) return "–"; n=Number(n); const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+" "+u[i]; }
 function pct(n){ return (n*100).toFixed(2) + "%"; }
 function fmtUptime(s){ if(s==null) return "–"; s=Math.floor(s); const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60); return (d>0?d+"天 ":"")+h+"时"+m+"分"; }
 
@@ -1400,6 +1502,29 @@ function render(d){
     ${(kv.by_model||[]).map(m=>`<div class="meta" style="margin-top:6px">${m.model}：KV ${m.usage_perc!=null?m.usage_perc.toFixed(1)+"%":"–"} / Prefix命中 ${m.prefix_hit_rate!=null?(m.prefix_hit_rate*100).toFixed(1)+"%":"–"}</div>`).join("")}`;
   } else {
     kvEl.innerHTML = `<div class="meta">KV Cache 监控不可用（vLLM 未暴露或无数据）</div>`;
+  }
+
+  // database instance (postgres-exporter via Prometheus)
+  const dbEl = document.getElementById("database");
+  const pg = d.database || {};
+  if (pg.available){
+    const srcTag = pg.source === "db_direct"
+      ? `<span class="tag warning">兜底:直连DB</span>`
+      : `<span class="tag ok">Prometheus</span>`;
+    const ratio = pg.cache_hit_ratio != null ? (pg.cache_hit_ratio * 100).toFixed(2) + "%" : "–";
+    const sizes = (pg.db_sizes || []).map(s => `${s.datname}: ${fmtBytes(s.bytes)}`).join("<br>") || "–";
+    dbEl.innerHTML = `<table>
+      <tr><th>状态</th><td><span class="dot ${pg.up ? "on" : "off"}"></span>${pg.up ? "运行中" : "异常"} ${srcTag}</td>
+          <th>角色</th><td>${pg.is_replica ? "从库" : "主库"}</td></tr>
+      <tr><th>总连接数</th><td>${fmt(pg.total_connections)}</td><th>活跃连接</th><td>${fmt(pg.active_connections)}</td></tr>
+      <tr><th>提交 TPS</th><td>${pg.commits_per_sec != null ? pg.commits_per_sec : "–"}/s</td>
+          <th>回滚 TPS</th><td>${pg.rollbacks_per_sec != null ? pg.rollbacks_per_sec : "–"}/s</td></tr>
+      <tr><th>缓存命中率</th><td>${ratio}</td>
+          <th>死锁/冲突/临时文件</th><td>${fmt(pg.deadlocks)} / ${fmt(pg.conflicts)} / ${fmt(pg.temp_files)}</td></tr>
+      <tr><th>库大小</th><td colspan="3">${sizes}</td></tr>
+    </table>`;
+  } else {
+    dbEl.innerHTML = `<div class="meta">数据库实例监控不可用${pg.error ? "：" + pg.error : ""}</div>`;
   }
 
   // health
