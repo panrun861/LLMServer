@@ -1,0 +1,65 @@
+# PLLM 监控栈：Prometheus + 专业 exporter 替代手搓采集
+# 独立于 app 部署，仅暴露 9090(Prometheus UI/API) 供看板查询。
+# 用法：docker compose -f monitoring/docker-compose.monitoring.yml up -d
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: pllm-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [monitoring]
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: pllm-node-exporter
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($$|/)
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro
+    networks: [monitoring]
+
+  nvidia-gpu-exporter:
+    image: mindprince/nvidia_gpu_prometheus_exporter:0.1
+    container_name: pllm-nvidia-gpu-exporter
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+    networks: [monitoring]
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: pllm-postgres-exporter
+    restart: unless-stopped
+    environment:
+      # 占位符在部署时由服务器 .env 中的 litellm 密码替换（避免明文入库）
+      DATA_SOURCE_NAME: "postgresql://litellm:__PGPASS__@host.docker.internal:5432/aitube_pllm?sslmode=disable"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [monitoring]
+
+networks:
+  monitoring:
+    driver: bridge
+
+volumes:
+  prometheus_data:

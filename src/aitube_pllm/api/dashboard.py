@@ -29,9 +29,14 @@ import socket as _socket
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+# Prometheus 统一采集端点（监控栈）。app 容器通过 host.docker.internal 访问宿主机 9090。
+# 该地址不可达时，下方各采集函数自动回退到原有的手搓采集（docker stats / nvidia-smi / /proc）。
+_PROM_URL = os.environ.get("PLLM_PROMETHEUS_URL", "http://host.docker.internal:9090")
 
 import http.client as _http
 from fastapi import APIRouter, Query, Request, HTTPException, status
@@ -70,6 +75,36 @@ async def _check_litellm() -> bool:
         return await asyncio.to_thread(_probe)
     except Exception:
         return False
+
+
+# ========== Prometheus 查询助手 ==========
+
+async def _prom_query(expr: str) -> Optional[list]:
+    """对 Prometheus 执行 instant query，返回 result 列表：
+    [{ "metric": {label:val,...}, "value": [ts, "valstr"] }, ...]
+    失败时返回 None（调用方据此回退到手搓采集）。
+    """
+    try:
+        url = f"{_PROM_URL}/api/v1/query?query={urllib.parse.quote(expr)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "pllm-dashboard"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            data = _json.loads(r.read().decode("utf-8", "replace"))
+        if data.get("status") != "success":
+            return None
+        return data["data"]["result"]
+    except Exception:
+        return None
+
+
+async def _prom_single(expr: str) -> Optional[float]:
+    """取单值指标（无标签），返回 float 或 None。"""
+    res = await _prom_query(expr)
+    if not res:
+        return None
+    try:
+        return float(res[0]["value"][1])
+    except Exception:
+        return None
 
 
 # ========== 推理引擎实时并发采集（运行中 + 排队中请求数） ==========
@@ -208,11 +243,117 @@ def _parse_vllm_metrics(text: str) -> Optional[dict]:
     }
 
 
+async def _collect_inference_from_prometheus() -> Optional[dict]:
+    """从 Prometheus 查询 vLLM 原生指标，构造与 _parse_vllm_metrics 完全一致的
+    inference 结构。任一关键查询失败/无数据返回 None（上层回退到直连 vLLM）。"""
+    (running_res, waiting_res, waiting_reason_res, kv_res,
+     pq_res, ph_res, cache_cfg_res) = await asyncio.gather(
+        _prom_query("sum by (model_name)(vllm:num_requests_running)"),
+        _prom_query("sum by (model_name)(vllm:num_requests_waiting)"),
+        _prom_query("sum by (model_name, reason)(vllm:num_requests_waiting_by_reason)"),
+        _prom_query("vllm:kv_cache_usage_perc"),
+        _prom_query("sum by (model_name)(vllm:prefix_cache_queries_total)"),
+        _prom_query("sum by (model_name)(vllm:prefix_cache_hits_total)"),
+        _prom_query("vllm:cache_config_info"),
+    )
+    if running_res is None and waiting_res is None:
+        return None  # Prometheus 不可达
+
+    def _f(res, label="model_name"):
+        out: dict = {}
+        if res:
+            for item in res:
+                m = item["metric"].get(label)
+                if m is not None:
+                    try:
+                        out[m] = float(item["value"][1])
+                    except Exception:
+                        out[m] = 0.0
+        return out
+
+    running = _f(running_res)
+    waiting = _f(waiting_res)
+    waiting_by_reason: dict = {}
+    if waiting_reason_res:
+        for item in waiting_reason_res:
+            m = item["metric"].get("model_name")
+            rsn = item["metric"].get("reason")
+            if m is not None and rsn is not None:
+                try:
+                    waiting_by_reason.setdefault(m, {})[rsn] = int(float(item["value"][1]))
+                except Exception:
+                    pass
+    kv_usage = _f(kv_res)
+    prefix_queries = _f(pq_res)
+    prefix_hits = _f(ph_res)
+
+    models = []
+    for m in sorted(set(list(running) + list(waiting) + list(kv_usage))):
+        models.append({
+            "model": m,
+            "running": int(running.get(m, 0)),
+            "waiting": int(waiting.get(m, 0)),
+            "total_inflight": int(running.get(m, 0)) + int(waiting.get(m, 0)),
+        })
+
+    total_q = sum(int(v) for v in prefix_queries.values())
+    total_h = sum(int(v) for v in prefix_hits.values())
+    kv_by_model = []
+    for m in sorted(kv_usage):
+        q = int(prefix_queries.get(m, 0))
+        h = int(prefix_hits.get(m, 0))
+        kv_by_model.append({
+            "model": m,
+            "usage_perc": kv_usage.get(m, 0.0),
+            "prefix_queries": q,
+            "prefix_hits": h,
+            "prefix_hit_rate": (h / q) if q else None,
+        })
+
+    cache_config: dict = {}
+    if cache_cfg_res:
+        labels = cache_cfg_res[0]["metric"]
+        for k in ("num_gpu_blocks", "kv_cache_size_tokens", "gpu_memory_utilization",
+                  "block_size", "cache_dtype", "enable_prefix_caching"):
+            if k in labels:
+                cache_config[k] = labels[k]
+        for k in ("num_gpu_blocks", "kv_cache_size_tokens", "block_size"):
+            if k in cache_config:
+                try:
+                    cache_config[k] = int(cache_config[k])
+                except Exception:
+                    pass
+        if "gpu_memory_utilization" in cache_config:
+            try:
+                cache_config["gpu_memory_utilization"] = float(cache_config["gpu_memory_utilization"])
+            except Exception:
+                pass
+
+    return {
+        "engine": "vllm",
+        "running_requests": int(sum(running.values())),
+        "queued_requests": int(sum(waiting.values())),
+        "total_inflight": int(sum(running.values()) + sum(waiting.values())),
+        "waiting_by_reason": waiting_by_reason,
+        "models": models,
+        "kv_cache": {
+            "usage_perc": next(iter(kv_usage.values())) if kv_usage else 0.0,
+            "by_model": kv_by_model,
+            "prefix_cache": {
+                "queries": total_q,
+                "hits": total_h,
+                "hit_rate": (total_h / total_q) if total_q else None,
+            },
+            "config": cache_config,
+        },
+    }
+
+
 async def collect_inference_metrics() -> dict:
     """采集推理引擎实时并发：运行中 + 排队中请求数。
 
-    优先取 vLLM（GPU 真实并发的 ground truth，PLLM→LiteLLM→vLLM 链路中
-    vLLM 才是真正占用 GPU 的层）。若 vLLM 不可达则优雅降级 available=false。
+    优先从 Prometheus 读取 vLLM 原生指标（统一采集栈）；若 Prometheus 不可用，
+    回退到直连 vLLM /metrics 文本解析。vLLM 才是真正占用 GPU 的层（ground truth）。
     """
     result = {
         "available": False,
@@ -230,6 +371,16 @@ async def collect_inference_metrics() -> dict:
             "config": {},
         },
     }
+    # 优先：Prometheus
+    try:
+        prom = await _collect_inference_from_prometheus()
+        if prom:
+            result.update(prom)
+            result["available"] = True
+            return result
+    except Exception:
+        pass
+    # 回退：直连 vLLM /metrics
     try:
         text = await asyncio.to_thread(_http_get_text, _VLLM_METRICS_URL, 3.0)
         if text:
@@ -238,7 +389,7 @@ async def collect_inference_metrics() -> dict:
                 result.update(parsed)
                 result["available"] = True
         if not result["available"]:
-            result["error"] = "vLLM metrics 不可达或无数据（host.docker.internal:8000/metrics）"
+            result["error"] = "vLLM metrics 不可达（Prometheus 与 host.docker.internal:8000/metrics 均未取到）"
     except Exception as e:  # noqa: BLE001
         result["error"] = str(e)[:200]
     return result
@@ -720,9 +871,126 @@ def _collect_system_sync() -> dict:
     return result
 
 
+async def _collect_host_from_prometheus() -> Optional[dict]:
+    """从 node_exporter 取主机资源，构造与 _collect_system_sync().host 一致的结构。"""
+    exprs = {
+        "cpu": "100 - (avg(rate(node_cpu_seconds_total{mode='idle'}[1m])) * 100)",
+        "mem_total": "node_memory_MemTotal_bytes",
+        "mem_avail": "node_memory_MemAvailable_bytes",
+        "disk_total": "max(node_filesystem_size_bytes{mountpoint='/'})",
+        "disk_free": "max(node_filesystem_free_bytes{mountpoint='/'})",
+        "load1": "node_load1",
+        "uptime": "(node_time_seconds - node_boot_time_seconds)",
+        "net_rx_bytes": "sum(node_network_receive_bytes_total{device!~'lo'})",
+        "net_tx_bytes": "sum(node_network_transmit_bytes_total{device!~'lo'})",
+        "net_rx_kbps": "sum(rate(node_network_receive_bytes_total{device!~'lo'}[1m]))/1024",
+        "net_tx_kbps": "sum(rate(node_network_transmit_bytes_total{device!~'lo'}[1m]))/1024",
+        "procs": "node_procs_running",
+    }
+    results = await asyncio.gather(*(_prom_single(e) for e in exprs.values()))
+    data = dict(zip(exprs.keys(), results))
+    if data.get("cpu") is None and data.get("mem_total") is None:
+        return None
+    mem_total = data.get("mem_total")
+    mem_avail = data.get("mem_avail")
+    mem_used = (mem_total - mem_avail) if (mem_total and mem_avail) else None
+    disk_total = data.get("disk_total")
+    disk_free = data.get("disk_free")
+    disk_used = (disk_total - disk_free) if (disk_total and disk_free) else None
+    return {
+        "cpu_percent": data.get("cpu"),
+        "mem_total_bytes": mem_total,
+        "mem_used_bytes": mem_used,
+        "mem_available_bytes": mem_avail,
+        "disk_total_bytes": disk_total,
+        "disk_used_bytes": disk_used,
+        "disk_free_bytes": disk_free,
+        "net_rx_bytes": data.get("net_rx_bytes"),
+        "net_tx_bytes": data.get("net_tx_bytes"),
+        "net_rx_kbps": data.get("net_rx_kbps"),
+        "net_tx_kbps": data.get("net_tx_kbps"),
+        "load_1m": data.get("load1"),
+        "uptime_seconds": data.get("uptime"),
+        "process_count": data.get("procs"),
+    }
+
+
+async def _collect_gpu_from_prometheus() -> dict:
+    """从 nvidia-gpu-exporter(NVML) 取 GPU 指标，构造与 _collect_gpu() 一致的结构。"""
+    duty, mem_used, mem_total, temp, power = await asyncio.gather(
+        _prom_query("nvidia_gpu_duty_cycle"),
+        _prom_query("nvidia_gpu_memory_used_bytes"),
+        _prom_query("nvidia_gpu_memory_total_bytes"),
+        _prom_query("nvidia_gpu_temperature_celsius"),
+        _prom_query("nvidia_gpu_power_usage_milliwatts"),
+    )
+    if not duty:
+        return {"available": False, "error": "nvidia_gpu_exporter 无数据（GPU exporter 未运行？）"}
+    try:
+        def _indexed(res):
+            out: dict = {}
+            if res:
+                for item in res:
+                    key = item["metric"].get("name") or item["metric"].get("minor_number") or "gpu"
+                    try:
+                        out[key] = float(item["value"][1])
+                    except Exception:
+                        out[key] = 0.0
+            return out
+
+        d_util = _indexed(duty)
+        d_memu = _indexed(mem_used)
+        d_memt = _indexed(mem_total)
+        d_temp = _indexed(temp)
+        d_pow = _indexed(power)
+        gpus = []
+        for i, name in enumerate(sorted(d_util.keys())):
+            gpus.append({
+                "index": i,
+                "name": name,
+                "utilization_percent": d_util.get(name, 0.0),
+                "memory_used_mb": (d_memu.get(name, 0.0) / 1048576.0),
+                "memory_total_mb": (d_memt.get(name, 0.0) / 1048576.0),
+                "temperature_c": d_temp.get(name),
+                "power_watts": (d_pow.get(name, 0.0) / 1000.0) if d_pow.get(name) is not None else None,
+            })
+        return {"available": True, "gpus": gpus}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "error": str(e)[:200]}
+
+
+async def _collect_system_from_prometheus() -> dict:
+    result = {"available": False, "error": None, "host": {}, "gpu": {}, "containers": []}
+    try:
+        host = await _collect_host_from_prometheus()
+        if host is None:
+            raise RuntimeError("Prometheus 主机指标缺失")
+        result["host"] = host
+        result["gpu"] = await _collect_gpu_from_prometheus()
+        # 容器指标：本机 docker 存储驱动为 overlayfs，cAdvisor 无法解析容器名，
+        # 故容器 CPU/内存/状态仍由并发 docker stats 采集（已在 ThreadPool 并发，~2s），
+        # 主机与 GPU 已全面改用 Prometheus（node_exporter / nvidia-gpu-exporter）。
+        loop = asyncio.get_event_loop()
+        result["containers"] = await loop.run_in_executor(None, _collect_containers)
+        result["available"] = True
+    except Exception as e:  # noqa: BLE001
+        result["error"] = f"Prometheus 采集失败：{str(e)[:160]}"
+        raise  # 触发上层回退到手搓采集
+    return result
+
+
 async def collect_system_metrics() -> dict:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _collect_system_sync)
+    """采集主机/容器/GPU 资源。
+
+    优先从 Prometheus（node_exporter / nvidia-gpu-exporter / cAdvisor）读取，
+    彻底去掉 docker stats 串行 + nvidia-smi + /proc 解析的重建开销；
+    若 Prometheus 不可达，自动回退到原有手搓采集，保证看板永不中断。
+    """
+    try:
+        return await _collect_system_from_prometheus()
+    except Exception:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _collect_system_sync)
 
 
 # ========== 快照缓存 + SSE 实时推送 ==========
