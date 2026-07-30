@@ -1,0 +1,35 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: pllm-monitor
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # 主机资源（CPU/内存/磁盘/网络/负载/进程）
+  - job_name: node
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # GPU 资源（NVML：利用率/显存/温度/功耗/时钟）
+  - job_name: nvidia-gpu
+    static_configs:
+      - targets: ['nvidia-gpu-exporter:9445']
+
+  # PostgreSQL 实例指标（连接/锁/缓冲/复制等）
+  - job_name: postgres
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # vLLM 原生 Prometheus 指标（running/waiting/kv_cache/prefix_cache/延迟/吞吐）
+  # vLLM 在宿主机 8000 端口发布，经 host-gateway 访问
+  - job_name: vllm
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:8000']
+
+  # 说明：LiteLLM /metrics 需鉴权(401)，不在此统一抓取；
+  # 看板中的 LiteLLM 状态由 dashboard 通过 API(master key) 探测。
