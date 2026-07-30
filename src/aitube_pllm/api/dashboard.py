@@ -1,7 +1,8 @@
 """监控大盘 API - 对外暴露只读聚合接口 + 内置看板页面
 
-- GET /admin/dashboard/snapshot : 返回全量监控数据 JSON（外部前端对接用，按需筛选）
-- GET /admin/dashboard          : 返回自包含 HTML 看板（自动注入 token）
+- GET /admin/dashboard/snapshot : 返回全量监控数据 JSON（外部前端对接用，按需筛选，带 TTL 缓存）
+- GET /admin/dashboard/stream   : SSE 实时推送（后台重建后即推，前端用 EventSource 接收，无轮询）
+- GET /admin/dashboard          : 返回自包含 HTML 看板（自动注入 token，已改为实时推送）
 
 认证：使用专用只读 token（PLLM_DASHBOARD_TOKEN），通过
 `Authorization: Bearer <token>` 或 `X-Dashboard-Token: <token>` 头传递。
@@ -34,7 +35,7 @@ from typing import Optional
 
 import http.client as _http
 from fastapi import APIRouter, Query, Request, HTTPException, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from ..config import settings
 from ..db import db
@@ -724,13 +725,16 @@ async def collect_system_metrics() -> dict:
     return await loop.run_in_executor(None, _collect_system_sync)
 
 
-# ========== 快照缓存（降低看板刷新延迟） ==========
-# 看板每 10s 刷新一次；snapshot 结果按 window 缓存 _SNAP_TTL 秒，后台任务周期性重建，
-# 使绝大多数请求直接命中缓存（<50ms），避免每次刷新都实时重算（含 docker stats 等慢采集）。
+# ========== 快照缓存 + SSE 实时推送 ==========
+# 后台每 _REBUILD_INTERVAL 秒重建一次快照：
+#  - 写入 _SNAP_CACHE（供 REST /snapshot 读取，命中 <50ms）
+#  - 推送给该窗口的 SSE 订阅者（/stream），实现“有数据即推送”的实时看板（无客户端轮询）
+_REBUILD_INTERVAL = 5
 _SNAP_TTL = 10
 _SNAP_CACHE: dict = {}
 _SNAP_LOCK = asyncio.Lock()
 _SCHEDULER_TASK = None
+_SSE_SUBS: dict = {}  # window -> set(asyncio.Queue)
 
 
 async def _refresh_snapshot(window: int) -> None:
@@ -766,14 +770,20 @@ async def get_cached_snapshot(window: int) -> dict:
 
 
 async def _snapshot_scheduler() -> None:
-    """后台周期性重建所有已请求过的窗口快照。"""
+    """后台周期性重建所有已请求过的窗口快照，并实时推送给 SSE 订阅者。"""
     while True:
-        await asyncio.sleep(_SNAP_TTL)
+        await asyncio.sleep(_REBUILD_INTERVAL)
         for w in list(_SNAP_CACHE.keys()):
             try:
                 await _refresh_snapshot(w)
             except Exception:
                 pass
+            # 推送给该窗口的 SSE 订阅者（队列满则跳过，不阻塞重建）
+            for q in list(_SSE_SUBS.get(w, set())):
+                try:
+                    q.put_nowait(_SNAP_CACHE[w]["data"])
+                except Exception:
+                    pass
 
 
 # ========== 路由 ==========
@@ -792,6 +802,57 @@ async def dashboard_snapshot(
             detail="Invalid or missing dashboard token",
         )
     return await get_cached_snapshot(window)
+
+
+@router.get("/stream")
+async def dashboard_stream(
+    request: Request,
+    window: int = Query(24, ge=1, le=720, description="统计窗口(小时)"),
+):
+    """SSE 实时推送：后台每 _REBUILD_INTERVAL 秒重建快照并主动推送给浏览器，
+    前端用 EventSource 接收，无需轮询。token 支持 Authorization 头或 ?token= 查询参数。"""
+    expected = settings.dashboard_token
+    token = _extract_token(request) or request.query_params.get("token")
+    if not expected or token != expected:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or missing dashboard token",
+        )
+    # 预热缓存并确保后台调度任务已启动
+    await get_cached_snapshot(window)
+    q = asyncio.Queue(maxsize=1)
+    subs = _SSE_SUBS.setdefault(window, set())
+    subs.add(q)
+
+    async def event_gen():
+        try:
+            # 首帧立即下发，避免客户端空等
+            yield _sse_frame(_SNAP_CACHE[window]["data"])
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    data = await asyncio.wait_for(q.get(), timeout=_REBUILD_INTERVAL + 2)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"  # 心跳保活，防止代理断开
+                    continue
+                yield _sse_frame(data)
+        finally:
+            subs.discard(q)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+def _sse_frame(data: dict) -> str:
+    return f"data: {_json.dumps(data, default=str)}\n\n"
 
 
 # ========== 内置 HTML 看板 ==========
@@ -890,31 +951,34 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 <script>
 const TOKEN = "__TOKEN__";
-const ENDPOINT = "/admin/dashboard/snapshot";
 let curWindow = 24;
 let chartTs, chartModel, chartSubject;
+let es = null;
+
+function connect(w){
+  if (es) es.close();
+  document.getElementById("err").textContent = "";
+  const url = "/admin/dashboard/stream?window=" + w + "&token=" + encodeURIComponent(TOKEN);
+  es = new EventSource(url);
+  es.onmessage = (ev) => {
+    let d; try { d = JSON.parse(ev.data); } catch(e){ return; }
+    render(d);
+    const gen = d.generated_at ? new Date(d.generated_at).toLocaleTimeString() : "—";
+    document.getElementById("updated").textContent = "实时推送 · 数据时间 " + gen;
+  };
+  es.onerror = () => { document.getElementById("err").textContent = "连接断开，正在重连…"; };
+}
 
 document.querySelectorAll("#winbtns button").forEach(b => {
   b.onclick = () => {
     document.querySelectorAll("#winbtns button").forEach(x => x.classList.remove("active"));
     b.classList.add("active");
     curWindow = Number(b.dataset.w);
-    load();
+    connect(curWindow);
   };
 });
 
-async function load(){
-  const errEl = document.getElementById("err");
-  errEl.textContent = "";
-  try {
-    const r = await fetch(ENDPOINT + "?window=" + curWindow, { headers: { "Authorization": "Bearer " + TOKEN } });
-    if (!r.ok) { errEl.textContent = "接口返回 " + r.status + "：" + (await r.text()).slice(0,200); return; }
-    const d = await r.json();
-    render(d);
-    const gen = d.generated_at ? new Date(d.generated_at).toLocaleTimeString() : "—";
-    document.getElementById("updated").textContent = "渲染 " + new Date().toLocaleTimeString() + " · 数据时间 " + gen;
-  } catch(e){ errEl.textContent = "请求失败：" + e.message; }
-}
+// 实时推送由 EventSource(connect) 驱动，不再使用轮询 load()
 
 function fmt(n){ return (n==null?0:n).toLocaleString(); }
 function pct(n){ return (n*100).toFixed(2) + "%"; }
@@ -1100,8 +1164,7 @@ function drawLine(canvasId, chartRef, labels, datasets, setRef){
                y1:{ position:"right", ticks:{color:"#8b97ad"}, grid:{display:false} } } } }));
 }
 
-load();
-setInterval(load, 10000);
+connect(curWindow);
 </script>
 </body>
 </html>"""
