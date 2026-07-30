@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json as _json
 import os
 import socket as _socket
@@ -430,10 +431,12 @@ async def build_snapshot(window_hours: int = 24) -> dict:
         for r in security_recent
     ]
 
-    # 系统资源（主机/容器/GPU）—— 独立采集，失败不影响业务数据
-    system = await collect_system_metrics()
-    # 推理引擎实时并发（运行中 + 排队中请求数）
-    inference = await collect_inference_metrics()
+    # 系统资源（主机/容器/GPU）、推理并发、litellm 连通性 一并并发采集，缩短总耗时
+    system, inference, litellm_reachable = await asyncio.gather(
+        collect_system_metrics(),
+        collect_inference_metrics(),
+        _check_litellm(),
+    )
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -491,7 +494,7 @@ async def build_snapshot(window_hours: int = 24) -> dict:
         },
         "health": {
             "db_ok": True,
-            "litellm_reachable": await _check_litellm(),
+            "litellm_reachable": litellm_reachable,
         },
     }
 
@@ -593,41 +596,46 @@ def _collect_gpu() -> dict:
         return {"available": False, "error": str(e)[:200]}
 
 
+# docker stats 单次约 2s，串行累加会很慢；用线程池并发拉取各容器指标
+_DOCKER_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+
+
+def _parse_container_stats(c: dict) -> dict:
+    cid = c.get("Id")
+    name = (c.get("Names") or ["?"])[0].lstrip("/")
+    stats = _docker_request("GET", f"/containers/{cid}/stats?stream=false")
+    cpu_pct = mem = None
+    if stats:
+        try:
+            cs0 = stats["cpu_stats"]
+            pcs0 = stats.get("precpu_stats", {}) or {}
+            cpu_delta = cs0["cpu_usage"]["total_usage"] - pcs0.get("cpu_usage", {}).get("total_usage", 0)
+            sys_delta = cs0.get("system_cpu_usage", 0) - pcs0.get("system_cpu_usage", 0)
+            online = cs0.get("online_cpus") or len(cs0.get("percpu_usage") or [1])
+            cpu_pct = round((cpu_delta / sys_delta) * online * 100, 1) if sys_delta > 0 else 0.0
+        except Exception:
+            cpu_pct = None
+        try:
+            mem = stats["memory_stats"]["usage"]
+            cache = stats["memory_stats"].get("stats", {}).get("cache", 0)
+            if cache:
+                mem -= cache
+        except Exception:
+            mem = None
+    return {
+        "name": name,
+        "image": c.get("Image"),
+        "status": c.get("Status"),
+        "cpu_percent": cpu_pct,
+        "mem_usage_bytes": mem,
+    }
+
+
 def _collect_containers() -> list:
     cs = _docker_request("GET", "/containers/json?size=false")
     if not cs:
         return []
-    out = []
-    for c in cs:
-        cid = c.get("Id")
-        name = (c.get("Names") or ["?"])[0].lstrip("/")
-        stats = _docker_request("GET", f"/containers/{cid}/stats?stream=false")
-        cpu_pct = mem = None
-        if stats:
-            try:
-                cs0 = stats["cpu_stats"]
-                pcs0 = stats.get("precpu_stats", {}) or {}
-                cpu_delta = cs0["cpu_usage"]["total_usage"] - pcs0.get("cpu_usage", {}).get("total_usage", 0)
-                sys_delta = cs0.get("system_cpu_usage", 0) - pcs0.get("system_cpu_usage", 0)
-                online = cs0.get("online_cpus") or len(cs0.get("percpu_usage") or [1])
-                cpu_pct = round((cpu_delta / sys_delta) * online * 100, 1) if sys_delta > 0 else 0.0
-            except Exception:
-                cpu_pct = None
-            try:
-                mem = stats["memory_stats"]["usage"]
-                cache = stats["memory_stats"].get("stats", {}).get("cache", 0)
-                if cache:
-                    mem -= cache
-            except Exception:
-                mem = None
-        out.append({
-            "name": name,
-            "image": c.get("Image"),
-            "status": c.get("Status"),
-            "cpu_percent": cpu_pct,
-            "mem_usage_bytes": mem,
-        })
-    return out
+    return list(_DOCKER_EXECUTOR.map(_parse_container_stats, cs))
 
 
 def _collect_system_sync() -> dict:
@@ -716,6 +724,58 @@ async def collect_system_metrics() -> dict:
     return await loop.run_in_executor(None, _collect_system_sync)
 
 
+# ========== 快照缓存（降低看板刷新延迟） ==========
+# 看板每 10s 刷新一次；snapshot 结果按 window 缓存 _SNAP_TTL 秒，后台任务周期性重建，
+# 使绝大多数请求直接命中缓存（<50ms），避免每次刷新都实时重算（含 docker stats 等慢采集）。
+_SNAP_TTL = 10
+_SNAP_CACHE: dict = {}
+_SNAP_LOCK = asyncio.Lock()
+_SCHEDULER_TASK = None
+
+
+async def _refresh_snapshot(window: int) -> None:
+    _SNAP_CACHE[window] = {
+        "data": await build_snapshot(window),
+        "ts": time.time(),
+    }
+
+
+async def get_cached_snapshot(window: int) -> dict:
+    """读取带 TTL 缓存的快照；未命中时在锁内重建，并确保后台刷新任务已启动。"""
+    global _SCHEDULER_TASK
+    now = time.time()
+    cached = _SNAP_CACHE.get(window)
+    if cached and (now - cached["ts"]) < _SNAP_TTL:
+        return cached["data"]
+    async with _SNAP_LOCK:
+        cached = _SNAP_CACHE.get(window)
+        if cached and (now - cached["ts"]) < _SNAP_TTL:
+            return cached["data"]
+        try:
+            await _refresh_snapshot(window)
+        except Exception:
+            if cached:
+                return cached["data"]
+            raise
+        if _SCHEDULER_TASK is None or _SCHEDULER_TASK.done():
+            try:
+                _SCHEDULER_TASK = asyncio.create_task(_snapshot_scheduler())
+            except Exception:
+                _SCHEDULER_TASK = None
+        return _SNAP_CACHE[window]["data"]
+
+
+async def _snapshot_scheduler() -> None:
+    """后台周期性重建所有已请求过的窗口快照。"""
+    while True:
+        await asyncio.sleep(_SNAP_TTL)
+        for w in list(_SNAP_CACHE.keys()):
+            try:
+                await _refresh_snapshot(w)
+            except Exception:
+                pass
+
+
 # ========== 路由 ==========
 
 @router.get("/snapshot")
@@ -731,7 +791,7 @@ async def dashboard_snapshot(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid or missing dashboard token",
         )
-    return await build_snapshot(window)
+    return await get_cached_snapshot(window)
 
 
 # ========== 内置 HTML 看板 ==========
@@ -851,7 +911,8 @@ async function load(){
     if (!r.ok) { errEl.textContent = "接口返回 " + r.status + "：" + (await r.text()).slice(0,200); return; }
     const d = await r.json();
     render(d);
-    document.getElementById("updated").textContent = "更新于 " + new Date().toLocaleTimeString();
+    const gen = d.generated_at ? new Date(d.generated_at).toLocaleTimeString() : "—";
+    document.getElementById("updated").textContent = "渲染 " + new Date().toLocaleTimeString() + " · 数据时间 " + gen;
   } catch(e){ errEl.textContent = "请求失败：" + e.message; }
 }
 
@@ -1040,7 +1101,7 @@ function drawLine(canvasId, chartRef, labels, datasets, setRef){
 }
 
 load();
-setInterval(load, 30000);
+setInterval(load, 10000);
 </script>
 </body>
 </html>"""
