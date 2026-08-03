@@ -7,12 +7,12 @@ import time
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import httpx
 from fastapi import APIRouter, HTTPException, status, Request, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from ..config import settings
 from ..db import db, TokenRepo, ModelRepo, UsageRepo, AuditRepo
@@ -119,31 +119,75 @@ async def list_models(token_record: dict = Depends(bearer_auth)):
 # Chat Completion 请求模型
 # ---------------------------------------------------------------------------
 class ChatCompletionRequest(BaseModel):
-    """Chat Completion 请求（OpenAI 兼容）"""
+    """Chat Completion 请求（OpenAI 兼容，完整参数 + 扩展透传）。
+
+    1) 显式声明 OpenAI 官方 /v1/chat/completions 的全部标准参数；
+    2) model_config = ConfigDict(extra="allow") 兜底透传所有未声明字段
+       （如 vLLM/LiteLLM 扩展的 enable_thinking / thinking / repetition_penalty 等），
+       未知字段进入 model_extra，model_dump() 默认包含，最终原样转发给 LiteLLM。
+    """
+    model_config = ConfigDict(extra="allow")
+
+    # ---- 必填 ----
     model: str
     messages: list[dict]
+
+    # ---- 采样 / 生成控制（OpenAI 标准）----
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
     stream: Optional[bool] = False
-    stop: Optional[list[str]] = None
+    stop: Optional[Union[list[str], str]] = None
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
-    user: Optional[str] = None
-    # Function calling
-    tools: Optional[list[dict]] = None
-    tool_choice: Optional[Any] = None  # str | dict | None
-    # Structured output
-    response_format: Optional[dict] = None
-    # Reproducibility
-    seed: Optional[int] = None
-    # Advanced
     logit_bias: Optional[dict[str, float]] = None
     logprobs: Optional[bool] = None
     top_logprobs: Optional[int] = None
-    # Stream options (client-customizable; overridden for include_usage)
+    seed: Optional[int] = None
+    user: Optional[str] = None
+
+    # ---- 推理 / think 控制（OpenAI o-series 标准 + vLLM/LiteLLM 透传）----
+    reasoning_effort: Optional[str] = None          # low | medium | high
+    reasoning: Optional[dict] = None                # 新版 reasoning 控制对象
+    enable_thinking: Optional[bool] = None          # vLLM/Qwen 思考开关（透传）
+    thinking: Optional[dict] = None                 # {"type":"enabled","budget_tokens":N}（透传）
+    include_reasoning: Optional[bool] = None        # 流中返回 reasoning（透传）
+
+    # ---- 工具调用（OpenAI 标准）----
+    tools: Optional[list[dict]] = None
+    tool_choice: Optional[Any] = None               # str | dict | None
+    parallel_tool_calls: Optional[bool] = None
+    # legacy 兼容
+    functions: Optional[list[dict]] = None
+    function_call: Optional[Any] = None
+
+    # ---- 结构化输出 / 预测（OpenAI 标准）----
+    response_format: Optional[dict] = None
+    prediction: Optional[dict] = None
+
+    # ---- 多模态 / 音频（OpenAI 多模态标准）----
+    modalities: Optional[list[str]] = None          # ["text"] | ["text","audio"]
+    audio: Optional[dict] = None                    # {"voice":..,"format":..}
+
+    # ---- 流式（OpenAI 标准，内部强制 include_usage=True）----
     stream_options: Optional[dict] = None
+
+    # ---- 存储 / 元数据 / 服务层级（OpenAI 标准）----
+    store: Optional[bool] = None
+    metadata: Optional[dict] = None
+    service_tier: Optional[str] = None
+
+    # ---- vLLM 常用采样扩展（经 LiteLLM 透传）----
+    repetition_penalty: Optional[float] = None
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    typical_p: Optional[float] = None
+    add_generation_prompt: Optional[bool] = None
+
+    # ---- LiteLLM 透传开关 ----
+    drop_params: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -306,85 +350,93 @@ async def chat_completions(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            if body.stream:
-                # ---- 流式响应 ----
-                async def stream_generator():
-                    prompt_tokens = 0
-                    completion_tokens = 0
-                    total_tokens = 0
-                    upstream_status = 200
+        if body.stream:
+            # 流式响应：httpx 客户端生命周期必须由生成器自身持有。
+            # 若沿用外层 async with，函数返回后 StreamingResponse 惰性消费生成器时
+            # 客户端已关闭，导致 0 字节输出 / "client has been closed" 错误。
+            async def stream_generator():
+                prompt_tokens = 0
+                completion_tokens = 0
+                total_tokens = 0
+                upstream_status = 200
+                client = None
+                try:
+                    client = httpx.AsyncClient(timeout=120.0)
+                    async with client.stream(
+                        "POST",
+                        litellm_url,
+                        json=request_body,
+                        headers=headers,
+                    ) as response:
+                        upstream_status = response.status_code
+                        if response.status_code != 200:
+                            error_body = await response.aread()
+                            raise HTTPException(
+                                status_code=response.status_code,
+                                detail=error_body.decode(),
+                            )
 
-                    try:
-                        async with client.stream(
-                            "POST",
-                            litellm_url,
-                            json=request_body,
-                            headers=headers,
-                        ) as response:
-                            upstream_status = response.status_code
-                            if response.status_code != 200:
-                                error_body = await response.aread()
-                                raise HTTPException(
-                                    status_code=response.status_code,
-                                    detail=error_body.decode(),
-                                )
+                        async for line in response.aiter_lines():
+                            if line.startswith("data: "):
+                                yield line + "\n\n"
 
-                            async for line in response.aiter_lines():
-                                if line.startswith("data: "):
-                                    yield line + "\n\n"
+                                if line == "data: [DONE]":
+                                    break
 
-                                    if line == "data: [DONE]":
-                                        break
+                                try:
+                                    data = json.loads(line[6:])
+                                    if "usage" in data:
+                                        usage = data["usage"]
+                                        prompt_tokens = usage.get(
+                                            "prompt_tokens", 0
+                                        )
+                                        completion_tokens = usage.get(
+                                            "completion_tokens", 0
+                                        )
+                                        total_tokens = usage.get(
+                                            "total_tokens", 0
+                                        )
+                                except json.JSONDecodeError:
+                                    pass
+                except httpx.TimeoutException:
+                    upstream_status = 504
+                except httpx.RequestError:
+                    upstream_status = 502
+                finally:
+                    if client is not None:
+                        await client.aclose()
+                    # 无论正常结束还是客户端断开，都记录 usage
+                    latency_ms = int((time.time() - start_time) * 1000)
+                    await _record_usage(
+                        request_id=request_id,
+                        token_record=token_record,
+                        model_config=model_config,
+                        model_name=body.model,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        latency_ms=latency_ms,
+                        status_code=upstream_status,
+                        correlation_id=correlation_id,
+                    )
+                    await _record_inference_audit(
+                        request_id=request_id,
+                        token_record=token_record,
+                        model_name=body.model,
+                        status_code=upstream_status,
+                        result="success"
+                        if upstream_status == 200
+                        else "error",
+                    )
 
-                                    try:
-                                        data = json.loads(line[6:])
-                                        if "usage" in data:
-                                            usage = data["usage"]
-                                            prompt_tokens = usage.get(
-                                                "prompt_tokens", 0
-                                            )
-                                            completion_tokens = usage.get(
-                                                "completion_tokens", 0
-                                            )
-                                            total_tokens = usage.get(
-                                                "total_tokens", 0
-                                            )
-                                    except json.JSONDecodeError:
-                                        pass
-                    finally:
-                        # 无论正常结束还是客户端断开，都记录 usage
-                        latency_ms = int((time.time() - start_time) * 1000)
-                        await _record_usage(
-                            request_id=request_id,
-                            token_record=token_record,
-                            model_config=model_config,
-                            model_name=body.model,
-                            prompt_tokens=prompt_tokens,
-                            completion_tokens=completion_tokens,
-                            total_tokens=total_tokens,
-                            latency_ms=latency_ms,
-                            status_code=upstream_status,
-                            correlation_id=correlation_id,
-                        )
-                        await _record_inference_audit(
-                            request_id=request_id,
-                            token_record=token_record,
-                            model_name=body.model,
-                            status_code=upstream_status,
-                            result="success"
-                            if upstream_status == 200
-                            else "error",
-                        )
-
-                return StreamingResponse(
-                    stream_generator(),
-                    media_type="text/event-stream",
-                    headers={"X-Request-Id": str(request_id)},
-                )
-
-            else:
-                # ---- 非流式响应 ----
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={"X-Request-Id": str(request_id)},
+            )
+        else:
+            # ---- 非流式响应 ----
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 response = await client.post(
                     litellm_url,
                     json=request_body,
