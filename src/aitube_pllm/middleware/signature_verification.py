@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 
 from fastapi import Request, HTTPException, status
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from ..config import settings
 from ..db import db, IssuerRepo, NonceRepo, AuditRepo
@@ -30,6 +30,21 @@ class SignatureVerificationMiddleware(BaseHTTPMiddleware):
         if request.url.path.startswith("/admin/models") and request.headers.get("x-local-admin") == "true":
             return await call_next(request)
 
+        try:
+            return await self._verify(request, call_next)
+        except HTTPException as e:
+            # BaseHTTPMiddleware 中 raise 的 HTTPException 不会走 FastAPI 的
+            # exception handler，会冒泡成 500。此处显式转换为 JSON 响应，
+            # 保证 401/403/409 等业务状态码正确透传给调用方。
+            return JSONResponse(
+                status_code=e.status_code,
+                content={"detail": e.detail},
+                headers=getattr(e, "headers", None),
+            )
+
+    async def _verify(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
         gateway_request_id = uuid.uuid4()
         occurred_at = datetime.now(timezone.utc)
 
@@ -57,8 +72,9 @@ class SignatureVerificationMiddleware(BaseHTTPMiddleware):
                 decision="rejected",
                 issuer_id_claim=issuer_id,
                 key_id_claim=key_id,
-                reason_code=f"missing_headers:{','.join(missing)}",
+                reason_code="missing_headers",
                 response_status=401,
+                detail={"missing_headers": missing},
             )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -91,8 +107,9 @@ class SignatureVerificationMiddleware(BaseHTTPMiddleware):
                     decision="rejected",
                     issuer_id_claim=issuer_id,
                     key_id_claim=key_id,
-                    reason_code=f"timestamp_expired:delta={delta:.0f}s",
+                    reason_code="timestamp_expired",
                     response_status=401,
+                    detail={"delta_seconds": int(delta), "window_seconds": settings.signature_timestamp_window},
                 )
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -174,8 +191,9 @@ class SignatureVerificationMiddleware(BaseHTTPMiddleware):
                     decision="rejected",
                     issuer_id_claim=issuer_id,
                     key_id_claim=key_id,
-                    reason_code=f"signature_verification_failed:{type(e).__name__}",
+                    reason_code="signature_verification_failed",
                     response_status=401,
+                    detail={"error": type(e).__name__},
                 )
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
@@ -214,8 +232,12 @@ class SignatureVerificationMiddleware(BaseHTTPMiddleware):
         key_id_claim: str | None,
         reason_code: str,
         response_status: int,
+        detail: dict | str | None = None,
     ) -> None:
         """记录安全事件审计日志"""
+        # 防御性截断：security_event_logs.reason_code 为 VARCHAR(64)，
+        # 避免超长 reason_code 导致审计写入失败（曾因 missing_headers 拼接超长被静默吞掉）。
+        reason_code = reason_code[:64]
         try:
             async with db.pool.acquire() as conn:
                 await AuditRepo.record_security_event(
@@ -230,7 +252,7 @@ class SignatureVerificationMiddleware(BaseHTTPMiddleware):
                     source_address=request.client.host if request.client else None,
                     reason_code=reason_code,
                     response_status=response_status,
-                    detail=None,
+                    detail=detail,
                 )
         except Exception as e:
             # 审计日志记录失败时，根据 fail-closed 原则，应该拒绝请求
