@@ -51,11 +51,12 @@ class ModelRegisterRequest(BaseModel):
         "litellm",
         description="统一经 LiteLLM 网关路由。外部 API 由 PLLM 自动注入 LiteLLM",
     )
-    upstream_type: Optional[Literal["local_vllm", "external_api"]] = Field(
-        None,
+    upstream_type: Literal["local_vllm", "external_api"] = Field(
+        "local_vllm",
         description=(
-            "声明上游来源：local_vllm=本机 vLLM 服务；"
-            "external_api=第三方 API（由 PLLM 注入 LiteLLM）"
+            "声明上游来源：local_vllm=本地 vLLM 部署（允许多节点，各配不同 api_base）；"
+            "external_api=第三方 API（如 OpenAI/Claude）。"
+            "所有类型均由 PLLM 全量注入 LiteLLM，不再依赖静态 config.yaml"
         ),
     )
     context_length: int = Field(
@@ -66,12 +67,12 @@ class ModelRegisterRequest(BaseModel):
     api_base: Optional[str] = Field(
         None,
         max_length=500,
-        description="外部 API 时必填：第三方 API 的基础地址（如 https://api.openai.com/v1）",
+        description="模型后端地址：external_api 时必须（如 https://api.openai.com/v1）；local_vllm 时选填（如 http://10.0.0.5:8000/v1，多节点时分别填不同地址）",
     )
     api_key: Optional[str] = Field(
         None,
         max_length=1024,
-        description="外部 API 时必填：第三方 API 的密钥（存储在 DB 中加密）",
+        description="模型后端密钥：external_api 时必须；local_vllm 时选填。存入 DB 前 AES 加密",
     )
     runtime_params: Optional[dict] = None
     request_params: Optional[dict] = None
@@ -95,24 +96,25 @@ class TierActivateRequest(BaseModel):
 async def register_model(body: ModelRegisterRequest, request: Request):
     """登记新模型 (localhost CLI only)
 
-    - 本地 vLLM 模型：upstream_type=local_vllm，api_key 可选
-    - 外部 API 模型：upstream_type=external_api，api_base + api_key 必填
-      API key 存入 DB 时通过 AES 加密（PLLM_ENCRYPTION_KEY），并自动注入 LiteLLM
+    所有类型的模型均由 PLLM 统一管理并注入 LiteLLM（全量覆盖 /v1/config/save），
+    不再依赖 LiteLLM 静态 config.yaml。
+
+    - local_vllm（默认）：同一或多台 vLLM 节点，各配不同 api_base，api_key 可选
+    - external_api：第三方 API，api_base + api_key 必填，key 存储前 AES 加密
     """
     _require_local_admin(request)
 
     # 外部 API 必填字段校验
-    is_external = body.upstream_type == "external_api"
-    if is_external:
+    if body.upstream_type == "external_api":
         if not body.api_base:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="外部 API 模型必须提供 api_base",
+                detail="external_api 模型必须提供 api_base",
             )
         if not body.api_key:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="外部 API 模型必须提供 api_key",
+                detail="external_api 模型必须提供 api_key",
             )
 
     # 加密 api_key
@@ -120,10 +122,9 @@ async def register_model(body: ModelRegisterRequest, request: Request):
 
     # 构建 payload（api_key 不入库，只存加密版本）
     payload = body.model_dump(exclude={"api_key"})
-    if body.upstream_type:
-        rp = dict(payload.get("runtime_params") or {})
-        rp["upstream_type"] = body.upstream_type
-        payload["runtime_params"] = json.dumps(rp)
+    rp = dict(payload.get("runtime_params") or {})
+    rp["upstream_type"] = body.upstream_type
+    payload["runtime_params"] = json.dumps(rp)
     payload["api_key_encrypted"] = api_key_encrypted
 
     async with db.pool.acquire() as conn:
@@ -152,17 +153,17 @@ async def register_model(body: ModelRegisterRequest, request: Request):
             },
         )
 
-    # 自动注入 LiteLLM（仅外部 API）
+    # 注入 LiteLLM：所有类型注册/更新后均触发全量重注入
     litellm_result = None
-    if is_external and body.api_key and body.api_base:
-        litellm_data = {
-            "model_name": body.model_name,
-            "model_artifact": body.model_artifact,
-            "api_base": body.api_base,
-            "api_key": body.api_key,
-            "is_enabled": body.is_enabled,
-        }
-        litellm_result = await inject_single_model(litellm_data)
+    litellm_data = {
+        "model_name": body.model_name,
+        "model_artifact": body.model_artifact,
+        "api_base": body.api_base,
+        "api_key": body.api_key,
+        "upstream_type": body.upstream_type,
+        "is_enabled": body.is_enabled,
+    }
+    litellm_result = await inject_single_model(litellm_data)
 
     return {
         "id": model["id"],
