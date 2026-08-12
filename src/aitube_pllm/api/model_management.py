@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from ..db import db, ModelRepo, AuditRepo
 from ..tasks.model_sync import sync_models_from_upstream
 from ..tasks.litellm_inject import inject_single_model
-from ..utils.crypto import encrypt
+from ..utils.crypto import encrypt, decrypt
 
 router = APIRouter(prefix="/admin/models", tags=["Model Management"])
 
@@ -34,6 +34,24 @@ def _extract_upstream_type(runtime_params) -> Optional[str]:
         except (ValueError, TypeError):
             return None
     return (runtime_params or {}).get("upstream_type")
+
+
+def _mask_api_key(encrypted: Optional[str]) -> Optional[str]:
+    """解密后返回掩码格式（首尾明文 + 中间打码），用于管理端展示校验。
+
+    格式示例：``sk-Ab********wXyZ`` —— 仅显示前 4 位与后 4 位真实字符，
+    中间以 ``*`` 隐藏，不泄露完整密钥。解密失败或为空时返回 None。
+    """
+    plaintext = decrypt(encrypted)
+    if not plaintext:
+        return None
+    n = len(plaintext)
+    head, tail = 4, 4
+    if n <= head + tail:
+        if n <= 2:
+            return "*" * n
+        return plaintext[0] + "*" * (n - 2) + plaintext[-1]
+    return f"{plaintext[:head]}{'*' * 8}{plaintext[-tail:]}"
 
 
 class ModelRegisterRequest(BaseModel):
@@ -245,6 +263,7 @@ async def list_models(
             "upstream_type": _extract_upstream_type(m.get("runtime_params")),
             "context_length": m["context_length"],
             "api_base": m["api_base"],
+            "api_key_masked": _mask_api_key(m.get("api_key_encrypted")),
             "is_current": m["is_current"],
             "is_enabled": m["is_enabled"],
             "sync_status": m["sync_status"],
@@ -276,6 +295,7 @@ async def list_tiers(model_name: str, request: Request):
                 "is_current": t["is_current"],
                 "is_enabled": t["is_enabled"],
                 "sync_status": t["sync_status"],
+                "api_key_masked": _mask_api_key(t.get("api_key_encrypted")),
             }
             for t in tiers
         ],
