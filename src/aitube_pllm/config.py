@@ -96,6 +96,13 @@ class Settings(BaseSettings):
         description="LiteLLM Proxy admin API 地址；为空时由 litellm_api_base 推导（默认同 liteLLM 地址）",
     )
 
+    # LiteLLM 注入用 vLLM 真实地址（local_vllm 模型注册到 LiteLLM 时的 api_base）
+    litellm_vllm_api_base: str = Field(
+        default="http://vllm:8000/v1",
+        description="vLLM 真实 API 地址（从 LiteLLM 容器网络视角，如 http://vllm:8000/v1），用于 local_vllm 类型模型注入；"
+        "不能用 PLLM DB 里指向 LiteLLM 自身的 api_base，否则形成回环",
+    )
+
     model_config = {
         "env_prefix": "PLLM_",
         "env_file": ".env",

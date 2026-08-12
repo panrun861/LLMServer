@@ -9,7 +9,9 @@ PLLM 启动时从 models 表读取所有已登记模型（local_vllm + external_
     model_list。改用 ``/model/new`` 单模型注册，并依赖 ``STORE_MODEL_IN_DB=True``
     将模型持久化到 LiteLLM 自己的数据库（重启后仍生效）。
 
-幂等：每个模型注册前先 ``POST /model/delete`` 删除同名 DB 记录，再 ``/model/new``。
+幂等：注册前先拉取 LiteLLM 已注册列表，若已存在完全相同（model_name + model + api_base）
+的条目则跳过，避免每次重启累加重复/错误条目（LiteLLM 1.92 的 ``/model/delete`` 必须传
+``id`` 而 ``/model/info`` 不返回 ``id``，故不采用删除重建策略）。
 
 不再依赖 LiteLLM 静态 config.yaml 的 model_list —— 静态 model_list 已清空，
 所有模型路由由 PLLM 数据库统一管理，启动时一次性注入。
@@ -97,23 +99,25 @@ async def fetch_all_registered_models() -> list[dict]:
 def _model_new_payload(m: dict) -> dict[str, Any]:
     """构造单个模型的 POST /model/new 请求体。
 
-    provider 推断规则：
-    - local_vllm → ``hosted_vllm/{artifact}``（LiteLLM 对 vLLM 的原生 provider）
-    - external_api + artifact 含 ``/`` → ``{provider}/{artifact}``（如 ``openai/gpt-4o``）
-    - external_api + artifact 不含 ``/`` → default ``openai/{artifact}``
+    provider 推断规则（修复双前缀与回环 api_base 问题）：
+    - local_vllm → ``hosted_vllm/{裸模型名}``（剥掉 artifact 里的 ``openai/`` 等前缀，
+      如 ``openai/qwen3.6-27b`` → ``hosted_vllm/qwen3.6-27b``）；api_base 强制用
+      ``settings.litellm_vllm_api_base``（vLLM 真实地址），**不能**用 PLLM DB 里指向
+      LiteLLM 自身的 api_base，否则形成回环。
+    - external_api → 原样使用 artifact（已是 ``provider/model`` 形式，如 ``openai/gpt-4o``，
+      不再二次拼接前缀）；api_base 用 DB 里的真实外部端点。
     """
     artifact = m.get("model_artifact", m["model_name"])
     api_base = m.get("api_base") or ""
     upstream_type = m.get("upstream_type", "local_vllm")
 
     if upstream_type == "local_vllm":
-        litellm_model = f"hosted_vllm/{artifact}"
-    elif "/" in artifact:
-        provider = artifact.split("/")[0]
-        litellm_model = f"{provider}/{artifact}"
+        bare = artifact.split("/")[-1]
+        litellm_model = f"hosted_vllm/{bare}"
+        api_base = settings.litellm_vllm_api_base or api_base
     else:
-        # 外部 API 但 artifact 不带前缀，默认 openai
-        litellm_model = f"openai/{artifact}"
+        # external_api：artifact 已经是 provider/model，原样作为 LiteLLM model
+        litellm_model = artifact
 
     litellm_params: dict[str, Any] = {"model": litellm_model}
     if api_base:
@@ -127,18 +131,39 @@ def _model_new_payload(m: dict) -> dict[str, Any]:
     }
 
 
-async def _delete_model(client: httpx.AsyncClient, admin_url: str, model_name: str) -> None:
-    """删除 LiteLLM DB 中同名模型（幂等前置清理，忽略不存在的错误）。"""
+async def _get_existing_models(client: httpx.AsyncClient, admin_url: str) -> list[dict]:
+    """获取 LiteLLM 当前已注册模型列表（用于幂等判断）。"""
     try:
-        resp = await client.post(
-            f"{admin_url}/model/delete",
-            json={"model_name": model_name},
+        resp = await client.get(
+            f"{admin_url}/model/info",
             headers=_auth_header(),
         )
-        if resp.status_code not in (200, 201, 404):
-            logger.warning("删除同名模型 %s 返回 %d", model_name, resp.status_code)
+        if resp.status_code == 200:
+            return resp.json().get("data", [])
     except Exception as exc:  # noqa: BLE001
-        logger.warning("删除同名模型 %s 异常: %s", model_name, exc)
+        logger.warning("获取 LiteLLM 已注册模型失败: %s", exc)
+    return []
+
+
+def _already_registered(
+    existing: list[dict], model_name: str, payload: dict
+) -> bool:
+    """判断 payload 描述的模型是否已在 LiteLLM 中按相同 model+api_base 注册。
+
+    注：LiteLLM 1.92 的 ``/model/delete`` 必须传 ``id``（``model_name`` 会 422），
+    而 ``/model/info`` 又不返回 ``id``，因此无法可靠地按 id 删除。改用幂等策略：
+    若已存在完全匹配（model_name + litellm_params.model + api_base）的条目则跳过注册，
+    避免每次重启累加重复/错误条目。
+    """
+    want_model = payload["litellm_params"].get("model")
+    want_base = payload["litellm_params"].get("api_base")
+    for e in existing:
+        if e.get("model_name") != model_name:
+            continue
+        lp = e.get("litellm_params", {}) or {}
+        if lp.get("model") == want_model and lp.get("api_base") == want_base:
+            return True
+    return False
 
 
 async def inject_models_to_litellm() -> dict[str, Any]:
@@ -164,15 +189,21 @@ async def inject_models_to_litellm() -> dict[str, Any]:
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:
+        existing = await _get_existing_models(client, admin_url)
         for m in all_models:
             if not m.get("is_enabled"):
                 summary["skipped"] += 1
                 continue
             payload = _model_new_payload(m)
+            # 幂等：已存在完全相同的条目则跳过，避免重复/错误注册累加
+            if _already_registered(existing, m["model_name"], payload):
+                summary["skipped"] += 1
+                logger.info(
+                    "LiteLLM 模型已注册(跳过): %s -> %s",
+                    m["model_name"], payload["litellm_params"]["model"],
+                )
+                continue
             try:
-                # 幂等：先删除同名（忽略不存在）
-                await _delete_model(client, admin_url, m["model_name"])
-                # 注册
                 resp = await client.post(
                     f"{admin_url}/model/new",
                     json=payload,
@@ -211,7 +242,6 @@ async def inject_single_model(model_data: dict) -> dict[str, Any]:
     payload = _model_new_payload(target)
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            await _delete_model(client, admin_url, target["model_name"])
             resp = await client.post(
                 f"{admin_url}/model/new",
                 json=payload,
