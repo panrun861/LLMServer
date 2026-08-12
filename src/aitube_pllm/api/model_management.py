@@ -1,5 +1,6 @@
 """模型登记管理 API - 仅 localhost CLI 可用"""
 
+import json
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -19,6 +20,18 @@ def _require_local_admin(request: Request):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This endpoint is only available from localhost CLI",
         )
+
+
+def _extract_upstream_type(runtime_params) -> Optional[str]:
+    """安全提取 runtime_params 中的 upstream_type（兼容 dict / JSON 字符串 / None）"""
+    if not runtime_params:
+        return None
+    if isinstance(runtime_params, str):
+        try:
+            runtime_params = json.loads(runtime_params)
+        except (ValueError, TypeError):
+            return None
+    return (runtime_params or {}).get("upstream_type")
 
 
 class ModelRegisterRequest(BaseModel):
@@ -88,12 +101,12 @@ async def register_model(body: ModelRegisterRequest, request: Request):
     _require_local_admin(request)
 
     # 将 upstream_type 标记并入 runtime_params（已有 JSON 列，不参与推理路由），
-    # 避免新增 DB 列带来的迁移成本
+    # 避免新增 DB 列带来的迁移成本。序列化为字符串写入，兼容 text/jsonb 两种列类型
     payload = body.model_dump()
     if body.upstream_type:
         rp = dict(payload.get("runtime_params") or {})
         rp["upstream_type"] = body.upstream_type
-        payload["runtime_params"] = rp
+        payload["runtime_params"] = json.dumps(rp)
 
     async with db.pool.acquire() as conn:
         existing = await ModelRepo.get_by_name_and_tier(conn, body.model_name, body.tier)
@@ -122,7 +135,7 @@ async def register_model(body: ModelRegisterRequest, request: Request):
         "tier": model["tier"],
         "model_artifact": model["model_artifact"],
         "inference_engine": model["inference_engine"],
-        "upstream_type": (model.get("runtime_params") or {}).get("upstream_type"),
+        "upstream_type": _extract_upstream_type(model.get("runtime_params")),
         "context_length": model["context_length"],
         "is_current": model["is_current"],
         "is_enabled": model["is_enabled"],
@@ -191,7 +204,7 @@ async def list_models(
             "tier": m["tier"],
             "model_artifact": m["model_artifact"],
             "inference_engine": m["inference_engine"],
-            "upstream_type": (m.get("runtime_params") or {}).get("upstream_type"),
+            "upstream_type": _extract_upstream_type(m.get("runtime_params")),
             "context_length": m["context_length"],
             "api_base": m["api_base"],
             "is_current": m["is_current"],
