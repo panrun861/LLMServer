@@ -1,6 +1,6 @@
 """模型登记管理 API - 仅 localhost CLI 可用"""
 
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -24,10 +24,41 @@ def _require_local_admin(request: Request):
 class ModelRegisterRequest(BaseModel):
     model_name: str = Field(..., max_length=255)
     tier: str = Field("medium", max_length=32)
-    model_artifact: str = Field(..., max_length=255)
-    inference_engine: str = Field(..., max_length=64)
-    context_length: int = Field(..., gt=0)
-    api_base: Optional[str] = Field(None, max_length=500)
+    model_artifact: str = Field(
+        ...,
+        max_length=255,
+        description=(
+            "LiteLLM 中登记的模型别名。本地 vLLM 与外部 API 统一经 LiteLLM 网关："
+            "外部 API 需先在 LiteLLM 侧注册并配置真实 api_base/key，这里只填其别名"
+        ),
+    )
+    inference_engine: Literal["litellm"] = Field(
+        "litellm",
+        description=(
+            "统一经 LiteLLM 网关路由（本地 vLLM 与外部 API 均如此，真正的上游地址"
+            "由 LiteLLM 持有）。预留扩展位，未来可加入 direct 引擎"
+        ),
+    )
+    upstream_type: Optional[Literal["local_vllm", "external_api"]] = Field(
+        None,
+        description=(
+            "声明上游来源：local_vllm=本机 vLLM 服务；external_api=第三方 API"
+            "（经 LiteLLM 代理）。仅作运营标记，不改变路由（均走 LiteLLM）"
+        ),
+    )
+    context_length: int = Field(
+        ...,
+        gt=0,
+        description="上下文长度。本地 vLLM 可由同步任务自动回填；外部 API 建议手动填写",
+    )
+    api_base: Optional[str] = Field(
+        None,
+        max_length=500,
+        description=(
+            "仅作信息记录，不参与路由（PLLM 始终经 LiteLLM）。外部 API 的真实"
+            " api_base 应配置在 LiteLLM 侧"
+        ),
+    )
     runtime_params: Optional[dict] = None
     request_params: Optional[dict] = None
     is_current: bool = False
@@ -48,8 +79,21 @@ class TierActivateRequest(BaseModel):
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def register_model(body: ModelRegisterRequest, request: Request):
-    """登记新模型 (localhost CLI only)"""
+    """登记新模型 (localhost CLI only)
+
+    本地 vLLM 与外部 API 统一经 LiteLLM 网关：外部 API 需在 LiteLLM 侧先注册
+    （由其持有真实 api_base/key），此处 model_artifact 填 LiteLLM 别名即可。
+    upstream_type 仅作运营标记，不改变路由。
+    """
     _require_local_admin(request)
+
+    # 将 upstream_type 标记并入 runtime_params（已有 JSON 列，不参与推理路由），
+    # 避免新增 DB 列带来的迁移成本
+    payload = body.model_dump()
+    if body.upstream_type:
+        rp = dict(payload.get("runtime_params") or {})
+        rp["upstream_type"] = body.upstream_type
+        payload["runtime_params"] = rp
 
     async with db.pool.acquire() as conn:
         existing = await ModelRepo.get_by_name_and_tier(conn, body.model_name, body.tier)
@@ -59,7 +103,7 @@ async def register_model(body: ModelRegisterRequest, request: Request):
                 detail=f"Model already registered: {body.model_name}:{body.tier}",
             )
 
-        model = await ModelRepo.register(conn, **body.model_dump())
+        model = await ModelRepo.register(conn, **payload)
 
         await AuditRepo.record_event(
             conn,
@@ -69,7 +113,7 @@ async def register_model(body: ModelRegisterRequest, request: Request):
             target_type="model",
             target_id=f"{body.model_name}:{body.tier}",
             result="success",
-            detail=body.model_dump(),
+            detail=payload,
         )
 
     return {
@@ -77,6 +121,8 @@ async def register_model(body: ModelRegisterRequest, request: Request):
         "model_name": model["model_name"],
         "tier": model["tier"],
         "model_artifact": model["model_artifact"],
+        "inference_engine": model["inference_engine"],
+        "upstream_type": (model.get("runtime_params") or {}).get("upstream_type"),
         "context_length": model["context_length"],
         "is_current": model["is_current"],
         "is_enabled": model["is_enabled"],
@@ -145,6 +191,7 @@ async def list_models(
             "tier": m["tier"],
             "model_artifact": m["model_artifact"],
             "inference_engine": m["inference_engine"],
+            "upstream_type": (m.get("runtime_params") or {}).get("upstream_type"),
             "context_length": m["context_length"],
             "api_base": m["api_base"],
             "is_current": m["is_current"],
