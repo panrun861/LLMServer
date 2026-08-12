@@ -36,6 +36,43 @@ _MAX_MODEL_LEN_RE = re.compile(
     re.MULTILINE,
 )
 
+# 外部 API 模型的已知上下文长度（用于 LiteLLM /v1/models 不返回 max_model_len 时的兜底）
+# 当注册模型时未传 context_length（使用默认值 8192），同步时若匹配到此表则自动修正
+# 数据来源：各厂商官方文档；若不准确请更新后触发一次手动同步
+_EXTERNAL_CONTEXT_LENGTH: dict[str, int] = {
+    # OpenAI
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4-turbo": 128000,
+    "gpt-4": 8192,
+    "gpt-4-32k": 32768,
+    "gpt-3.5-turbo": 16385,
+    "gpt-3.5-turbo-16k": 16385,
+    "o1": 200000,
+    "o1-mini": 128000,
+    "o1-preview": 128000,
+    "o3": 200000,
+    "o3-mini": 200000,
+    "o4-mini": 200000,
+    # Claude (Anthropic)
+    "claude-4": 200000,
+    "claude-4-sonnet": 200000,
+    "claude-4-opus": 200000,
+    "claude-sonnet-4-20250514": 200000,
+    "claude-opus-4-20250514": 200000,
+    "claude-3-5-sonnet": 200000,
+    "claude-3-5-sonnet-20241022": 200000,
+    "claude-3-5-sonnet-20240620": 200000,
+    "claude-3-opus": 200000,
+    "claude-3-sonnet": 200000,
+    "claude-3-haiku": 200000,
+    # DeepSeek
+    "deepseek-v3": 131072,
+    "deepseek-r1": 131072,
+    "deepseek-chat": 131072,
+    "deepseek-reasoner": 131072,
+}
+
 
 async def _resolve_upstream_url() -> str:
     """解析上游 /v1/models 地址。"""
@@ -139,6 +176,35 @@ def _match_upstream(model: dict, upstream_ids: set[str]) -> str | None:
     return None
 
 
+def _resolve_external_context_length(model: dict) -> int | None:
+    """外部 API 模型兜底：通过 model_name / model_artifact 匹配已知上下文长度表。
+
+    LiteLLM /v1/models 对外部 API 模型（OpenAI/Claude/DeepSeek 等）不返回
+    max_model_len，此函数作为兜底修正 defaultValue 8192。
+    """
+    rp = model.get("runtime_params")
+    if isinstance(rp, str):
+        try:
+            import json
+            rp = json.loads(rp)
+        except (ValueError, TypeError):
+            pass
+    if (rp or {}).get("upstream_type") != "external_api":
+        return None
+
+    name = model.get("model_name", "")
+    artifact = model.get("model_artifact", "")
+    # 以 model_name 为主 key，model_artifact 去前缀为辅 key
+    for key in [name, artifact, artifact.split("/")[-1]]:
+        if key and key in _EXTERNAL_CONTEXT_LENGTH:
+            return _EXTERNAL_CONTEXT_LENGTH[key]
+        # 模糊匹配：model 开头的片段（如 gpt-4o-2024-05-13 → gpt-4o）
+        for known, ctx_len in _EXTERNAL_CONTEXT_LENGTH.items():
+            if key.startswith(known + "-") or key.startswith(known + "/"):
+                return ctx_len
+    return None
+
+
 def _resolve_context_length(model: dict, max_len_map: dict[str, int]) -> int | None:
     """从 max_len_map 中按候选 key 解析真实上下文长度。
 
@@ -190,7 +256,14 @@ async def sync_models_from_upstream() -> dict:
                 update: dict[str, Any] = {"sync_status": "synced"}
                 if settings.model_sync_disable_missing:
                     update["is_enabled"] = True
+
+                # 解析 context_length：
+                # 1. 优先从 max_len_map（上游 /v1/models + vLLM 原生端点）
+                # 2. 外部 API 模型 fallback 到已知上下文长度映射表
                 ctx = _resolve_context_length(model, max_len_map)
+                if not ctx:
+                    # 检查是否为外部 API 模型，使用内置映射表兜底
+                    ctx = _resolve_external_context_length(model)
                 if ctx:
                     update["context_length"] = ctx
                 update["last_synced_at"] = datetime.now(timezone.utc)
