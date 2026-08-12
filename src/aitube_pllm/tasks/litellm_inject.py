@@ -96,6 +96,40 @@ async def fetch_all_registered_models() -> list[dict]:
     return injectable
 
 
+# 已知的上游 provider 前缀（LiteLLM 识别）。external_api 的 artifact 若不以这些
+# 前缀开头，则视为 OpenAI 兼容端点（如硅基流动），自动补 ``openai/`` 前缀，
+# 这样用户只需输入 ``Qwen/Qwen3-8B`` 这类裸名即可，无需手写 provider 前缀。
+_KNOWN_PROVIDER_PREFIXES = (
+    "openai/", "azure/", "anthropic/", "gemini/", "bedrock/", "vertex/",
+    "cohere/", "groq/", "ollama/", "mistral/", "together/", "fireworks/",
+    "deepseek/", "openrouter/", "xinference/", "hosted_vllm/", "vllm/",
+    "huggingface/", "databricks/", "ai21/", "nlp_cloud/", "triton/",
+    "text-completion-openai/", "oobabooga/", "petals/", "palm/", "claude/",
+    "replicate/", "perplexity/", "aleph_alpha/", "baseten/", "nvidia_nim/",
+    "predibase/", "watsonx/", "sagemaker/", "empower/", "v0/", "maritalk/",
+    "novita/", "friends_claude/", "custom/", "openai-like/",
+)
+
+
+def _normalize_external_model(artifact: str) -> str:
+    """外部 API 模型标识归一化。
+
+    用户输入可以是裸名（如 ``Qwen/Qwen3-8B``）或带 provider 前缀
+    （如 ``openai/gpt-4o``）。若不含已知 provider 前缀，按 OpenAI 兼容端点处理，
+    自动补 ``openai/``——LiteLLM 转发时会剥掉该前缀，上游实际收到
+    ``Qwen/Qwen3-8B``，因此前缀只是 LiteLLM 的路由提示，**不会**发给供应商。
+
+    若直接去掉前缀写成 ``Qwen/Qwen3-8B`` 交给 LiteLLM，它反而会把 ``Qwen`` 当成
+    未知 provider 而报错，所以前缀必须保留，只是无需用户手写。
+    """
+    if not artifact:
+        return artifact
+    lowered = artifact.lower()
+    if any(lowered.startswith(p) for p in _KNOWN_PROVIDER_PREFIXES):
+        return artifact
+    return f"openai/{artifact}"
+
+
 def _model_new_payload(m: dict) -> dict[str, Any]:
     """构造单个模型的 POST /model/new 请求体。
 
@@ -104,8 +138,9 @@ def _model_new_payload(m: dict) -> dict[str, Any]:
       如 ``openai/qwen3.6-27b`` → ``hosted_vllm/qwen3.6-27b``）；api_base 强制用
       ``settings.litellm_vllm_api_base``（vLLM 真实地址），**不能**用 PLLM DB 里指向
       LiteLLM 自身的 api_base，否则形成回环。
-    - external_api → 原样使用 artifact（已是 ``provider/model`` 形式，如 ``openai/gpt-4o``，
-      不再二次拼接前缀）；api_base 用 DB 里的真实外部端点。
+    - external_api → artifact 作为 LiteLLM model；若用户只填裸名（如 ``Qwen/Qwen3-8B``）
+      未带 provider 前缀，自动补 ``openai/``（OpenAI 兼容端点）；api_base 用 DB 里的
+      真实外部端点。
     """
     artifact = m.get("model_artifact", m["model_name"])
     api_base = m.get("api_base") or ""
@@ -116,8 +151,8 @@ def _model_new_payload(m: dict) -> dict[str, Any]:
         litellm_model = f"hosted_vllm/{bare}"
         api_base = settings.litellm_vllm_api_base or api_base
     else:
-        # external_api：artifact 已经是 provider/model，原样作为 LiteLLM model
-        litellm_model = artifact
+        # external_api：artifact 作为 LiteLLM model；裸名自动补 openai/ 前缀
+        litellm_model = _normalize_external_model(artifact)
 
     litellm_params: dict[str, Any] = {"model": litellm_model}
     if api_base:

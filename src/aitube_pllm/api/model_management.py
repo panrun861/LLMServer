@@ -61,7 +61,9 @@ class ModelRegisterRequest(BaseModel):
         ...,
         max_length=255,
         description=(
-            "模型标识：外部 API 时填 provider/model-name（如 openai/gpt-4o）；"
+            "模型标识：外部 API 时填供应商模型名即可，provider 前缀可省略（如 "
+            "Qwen/Qwen3-8B，系统会自动补 openai/ 前缀作为 LiteLLM 路由提示，"
+            "上游实际收到 Qwen/Qwen3-8B）；也可显式写 openai/gpt-4o。"
             "本地 vLLM 时填 vLLM served name（如 qwen3.6-27b）"
         ),
     )
