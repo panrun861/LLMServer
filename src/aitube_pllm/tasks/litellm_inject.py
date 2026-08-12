@@ -1,13 +1,18 @@
 """LiteLLM 模型注入任务
 
 PLLM 启动时从 models 表读取所有已登记模型（local_vllm + external_api），
-解密 api_key_encrypted，构造 LiteLLM Proxy config 并通过
-PUT /v1/config/save API 全量动态注入。
+解密 api_key_encrypted，通过 LiteLLM 单模型管理端点 ``POST /model/new`` 逐模型注册。
 
-**不再依赖 LiteLLM 静态 config.yaml**——所有模型的路由、api_base、api_key
-均由 PLLM 数据库统一管理，启动时一次性注入。
+为何不用 /config/update：
+    LiteLLM 1.92 的 ``auth_utils.is_request_body_safe()`` 硬编码禁止请求体中包含
+    ``model_list``（无论 master 还是 admin key），因此无法用 /config/update 整体下发
+    model_list。改用 ``/model/new`` 单模型注册，并依赖 ``STORE_MODEL_IN_DB=True``
+    将模型持久化到 LiteLLM 自己的数据库（重启后仍生效）。
 
-注入内容包括：model_name（LiteLLM 别名）、provider、api_base、api_key。
+幂等：每个模型注册前先 ``POST /model/delete`` 删除同名 DB 记录，再 ``/model/new``。
+
+不再依赖 LiteLLM 静态 config.yaml 的 model_list —— 静态 model_list 已清空，
+所有模型路由由 PLLM 数据库统一管理，启动时一次性注入。
 """
 
 from __future__ import annotations
@@ -29,6 +34,11 @@ def _resolve_litellm_admin_url() -> str:
     if settings.litellm_admin_url:
         return settings.litellm_admin_url
     return settings.litellm_api_base.rstrip("/")
+
+
+def _auth_header() -> dict[str, str]:
+    """LiteLLM 调用鉴权头（master key 即可调用 /model/new）。"""
+    return {"Authorization": f"Bearer {settings.litellm_master_key}"}
 
 
 async def fetch_all_registered_models() -> list[dict]:
@@ -84,59 +94,59 @@ async def fetch_all_registered_models() -> list[dict]:
     return injectable
 
 
-def _build_litellm_config(models: list[dict]) -> dict[str, Any]:
-    """将模型列表转换为 LiteLLM Proxy config model_list 结构。
+def _model_new_payload(m: dict) -> dict[str, Any]:
+    """构造单个模型的 POST /model/new 请求体。
 
     provider 推断规则：
-    - local_vllm → ``hosted_vllm/{artifact}``（LiteLLM 对 vLLM 的原生 provider），
-      api_base 来自模型配置（必须指向 vLLM 后端，如 http://vllm:8000/v1）
+    - local_vllm → ``hosted_vllm/{artifact}``（LiteLLM 对 vLLM 的原生 provider）
     - external_api + artifact 含 ``/`` → ``{provider}/{artifact}``（如 ``openai/gpt-4o``）
     - external_api + artifact 不含 ``/`` → default ``openai/{artifact}``
     """
-    model_list_entries = []
-    for m in models:
-        if not m.get("is_enabled"):
-            continue
+    artifact = m.get("model_artifact", m["model_name"])
+    api_base = m.get("api_base") or ""
+    upstream_type = m.get("upstream_type", "local_vllm")
 
-        artifact = m.get("model_artifact", m["model_name"])
-        api_base = m.get("api_base") or ""
-        upstream_type = m.get("upstream_type", "local_vllm")
+    if upstream_type == "local_vllm":
+        litellm_model = f"hosted_vllm/{artifact}"
+    elif "/" in artifact:
+        provider = artifact.split("/")[0]
+        litellm_model = f"{provider}/{artifact}"
+    else:
+        # 外部 API 但 artifact 不带前缀，默认 openai
+        litellm_model = f"openai/{artifact}"
 
-        # 推断 provider 和完整 model 路径
-        if upstream_type == "local_vllm":
-            # 本地 vLLM 模型，使用 LiteLLM 的 hosted_vllm provider 路由
-            # （匹配现有 litellm-config.yaml 的 hosted_vllm/qwen3.6-27b 写法）
-            litellm_model = f"hosted_vllm/{artifact}"
-        elif "/" in artifact:
-            provider = artifact.split("/")[0]
-            litellm_model = f"{provider}/{artifact}"
-        else:
-            # 外部 API 但 artifact 不带前缀，默认 openai
-            litellm_model = f"openai/{artifact}"
+    litellm_params: dict[str, Any] = {"model": litellm_model}
+    if api_base:
+        litellm_params["api_base"] = api_base
+    if m.get("api_key"):
+        litellm_params["api_key"] = m["api_key"]
 
-        litellm_params: dict[str, Any] = {
-            "model": litellm_model,
-        }
-        if api_base:
-            litellm_params["api_base"] = api_base
-        if m.get("api_key"):
-            litellm_params["api_key"] = m["api_key"]
+    return {
+        "model_name": m["model_name"],
+        "litellm_params": litellm_params,
+    }
 
-        entry = {
-            "model_name": m["model_name"],
-            "litellm_params": litellm_params,
-        }
-        model_list_entries.append(entry)
 
-    return {"model_list": model_list_entries}
+async def _delete_model(client: httpx.AsyncClient, admin_url: str, model_name: str) -> None:
+    """删除 LiteLLM DB 中同名模型（幂等前置清理，忽略不存在的错误）。"""
+    try:
+        resp = await client.post(
+            f"{admin_url}/model/delete",
+            json={"model_name": model_name},
+            headers=_auth_header(),
+        )
+        if resp.status_code not in (200, 201, 404):
+            logger.warning("删除同名模型 %s 返回 %d", model_name, resp.status_code)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("删除同名模型 %s 异常: %s", model_name, exc)
 
 
 async def inject_models_to_litellm() -> dict[str, Any]:
-    """启动注入：读取所有已登记模型 → 解密 → 全量覆盖注入 LiteLLM。
+    """启动注入：读取所有已登记模型 → 解密 → 逐模型 POST /model/new 注册。
 
-    全量覆盖模式：从 PLLM 数据库读取全部已登记模型，构造完整的 model_list
-    并调用 PUT /v1/config/save 覆盖 LiteLLM 配置。不再依赖 LiteLLM 静态
-    config.yaml。
+    LiteLLM 1.92 的 /config/update 硬编码禁止 model_list，因此改用单模型端点
+    /model/new（需 STORE_MODEL_IN_DB=True 持久化到 LiteLLM DB）。每个模型注册前
+    先 DELETE 同名 DB 记录以保证幂等。
 
     返回注入结果摘要。
     """
@@ -145,115 +155,87 @@ async def inject_models_to_litellm() -> dict[str, Any]:
         logger.info("无已登记模型需要注入 LiteLLM")
         return {"injected": 0, "skipped": 0, "errors": [], "total": 0}
 
-    config = _build_litellm_config(all_models)
     admin_url = _resolve_litellm_admin_url()
-    save_url = f"{admin_url}/v1/config/save"
-
-    summary = {
+    summary: dict[str, Any] = {
         "injected": 0,
-        "skipped": len(all_models) - len(config.get("model_list", [])),
+        "skipped": 0,
         "total": len(all_models),
         "errors": [],
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.put(
-                save_url,
-                json=config,
-                headers={"Authorization": f"Bearer {settings.litellm_master_key}"},
-            )
-            if resp.status_code in (200, 201, 202):
-                summary["injected"] = len(config.get("model_list", []))
-                logger.info(
-                    "LiteLLM 全量注入完成: injected=%d skipped=%d total=%d config=%s",
-                    summary["injected"], summary["skipped"], summary["total"],
-                    config,
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for m in all_models:
+            if not m.get("is_enabled"):
+                summary["skipped"] += 1
+                continue
+            payload = _model_new_payload(m)
+            try:
+                # 幂等：先删除同名（忽略不存在）
+                await _delete_model(client, admin_url, m["model_name"])
+                # 注册
+                resp = await client.post(
+                    f"{admin_url}/model/new",
+                    json=payload,
+                    headers=_auth_header(),
                 )
-            else:
-                error_msg = f"LiteLLM /v1/config/save 返回 {resp.status_code}: {resp.text[:500]}"
-                logger.error(error_msg)
-                summary["errors"].append(error_msg)
-    except Exception as exc:  # noqa: BLE001
-        error_msg = f"LiteLLM 注入失败: {exc}"
-        logger.error(error_msg)
-        summary["errors"].append(error_msg)
+                if resp.status_code in (200, 201):
+                    summary["injected"] += 1
+                    logger.info(
+                        "LiteLLM 注册模型成功: %s -> %s api_base=%s",
+                        m["model_name"], payload["litellm_params"]["model"],
+                        payload["litellm_params"].get("api_base", ""),
+                    )
+                else:
+                    msg = f"注册 {m['model_name']} 返回 {resp.status_code}: {resp.text[:300]}"
+                    logger.error(msg)
+                    summary["errors"].append(msg)
+            except Exception as exc:  # noqa: BLE001
+                msg = f"注册 {m['model_name']} 异常: {exc}"
+                logger.error(msg)
+                summary["errors"].append(msg)
 
     return summary
 
 
 async def inject_single_model(model_data: dict) -> dict[str, Any]:
-    """注册新模型后触发全量重注入（确保 LiteLLM config 与 PLLM 数据库一致）。
-
-    因为 PUT /v1/config/save 是全量覆盖，不支持追加单个模型，
-    所以从数据库重新读取全部已登记模型后全量注入。
-    """
+    """注册新模型后触发单模型重注入（确保 LiteLLM 与 PLLM 数据库一致）。"""
     all_models = await fetch_all_registered_models()
-
-    # 检查当前模型是否已在列表中
-    existing_names = {m["model_name"] for m in all_models}
-    if model_data.get("model_name") not in existing_names:
-        logger.info("新注册模型 %s 不在注入列表中，跳过重注入", model_data.get("model_name"))
+    target = next(
+        (m for m in all_models if m["model_name"] == model_data.get("model_name")),
+        None,
+    )
+    if not target:
         return {"success": True, "note": "model not in injectable list"}
 
-    return await _do_full_injection(all_models)
-
-
-async def _do_full_injection(all_models: list[dict]) -> dict[str, Any]:
-    """执行全量注入 LiteLLM。"""
-    config = _build_litellm_config(all_models)
     admin_url = _resolve_litellm_admin_url()
-    save_url = f"{admin_url}/v1/config/save"
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.put(
-                save_url,
-                json=config,
-                headers={"Authorization": f"Bearer {settings.litellm_master_key}"},
+    payload = _model_new_payload(target)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            await _delete_model(client, admin_url, target["model_name"])
+            resp = await client.post(
+                f"{admin_url}/model/new",
+                json=payload,
+                headers=_auth_header(),
             )
-            if resp.status_code in (200, 201, 202):
-                logger.info("LiteLLM 全量注入成功: %d models", len(config.get("model_list", [])))
-                return {"success": True, "injected": len(config.get("model_list", []))}
-            else:
-                error_msg = f"LiteLLM 注入返回 {resp.status_code}: {resp.text[:500]}"
-                logger.error(error_msg)
-                return {"success": False, "error": error_msg}
-    except Exception as exc:  # noqa: BLE001
-        error_msg = f"LiteLLM 注入异常: {exc}"
-        logger.error(error_msg)
-        return {"success": False, "error": error_msg}
+            if resp.status_code in (200, 201):
+                return {"success": True, "injected": target["model_name"]}
+            return {"success": False, "error": f"返回 {resp.status_code}: {resp.text[:300]}"}
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error": str(exc)}
 
 
-async def remove_model_from_litellim(model_name: str) -> dict[str, Any]:
-    """从 LiteLLM 中移除指定模型的注入配置。
-
-    通过读取当前 config → 过滤该模型 → 重新保存。
-    """
+async def remove_model_from_litellm(model_name: str) -> dict[str, Any]:
+    """从 LiteLLM 删除指定模型（DB 中的记录）。"""
     admin_url = _resolve_litellm_admin_url()
-    save_url = f"{admin_url}/v1/config/save"
-    models_url = _resolve_litellm_admin_url() + "/v1/models"
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            # 先获取当前配置（通过 models 列表推断，或直接保存空 list）
-            resp = await client.get(
-                models_url,
-                headers={"Authorization": f"Bearer {settings.litellm_master_key}"},
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.post(
+                f"{admin_url}/model/delete",
+                json={"model_name": model_name},
+                headers=_auth_header(),
             )
-            if resp.status_code != 200:
-                return {"success": False, "error": f"获取 LiteLLM models 失败: {resp.status_code}"}
-
-            current_models = resp.json().get("data", [])
-            remaining = [m["id"] for m in current_models if m.get("id") != model_name]
-
-            # 重新构建 config（仅保留未删除的模型）
-            # 注意：这里简化为只保留现有模型中不匹配的
-            # 实际应通过 /v1/config/get 获取完整 config 再过滤
-            logger.warning(
-                "remove_model_from_litellim 暂不支持精确移除（需读取完整 config），"
-                "建议调用 PUT /v1/config/save 全量覆盖"
-            )
-            return {"success": False, "error": "精确移除暂不支持（需全量覆盖 config）"}
-    except Exception as exc:  # noqa: BLE001
-        return {"success": False, "error": str(exc)}
+            if resp.status_code in (200, 201, 404):
+                return {"success": True}
+            return {"success": False, "error": f"返回 {resp.status_code}: {resp.text[:300]}"}
+        except Exception as exc:  # noqa: BLE001
+            return {"success": False, "error": str(exc)}
