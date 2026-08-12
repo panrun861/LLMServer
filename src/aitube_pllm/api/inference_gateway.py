@@ -282,6 +282,10 @@ async def chat_completions(
     request_id = uuid.uuid4()
     start_time = time.time()
 
+    # 全局强制模型（PLLM_FORCE_MODEL）：设置后忽略客户端 model，统一路由到此模型；
+    # 未设置时退回客户端传入的 body.model。详见 docs/global-model-override-proposal.md。
+    effective_model = settings.force_model or body.model
+
     # X-Correlation-Id 长度校验（设计文档 §1.3: 超过 255 字符返回 422）
     correlation_id = request.headers.get("x-correlation-id")
     if correlation_id is not None and len(correlation_id) > 255:
@@ -292,18 +296,18 @@ async def chat_completions(
 
     # 从数据库查询模型配置
     async with db.pool.acquire() as conn:
-        model_config = await ModelRepo.get_current(conn, body.model)
+        model_config = await ModelRepo.get_current(conn, effective_model)
         if not model_config:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Model not found: {body.model}",
+                detail=f"Model not found: {effective_model}",
             )
 
         # is_enabled 检查：禁用的模型不可调用
         if not model_config["is_enabled"]:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Model not found: {body.model}",
+                detail=f"Model not found: {effective_model}",
             )
 
         # 速率限制检查（内存滑动窗口）
@@ -335,6 +339,8 @@ async def chat_completions(
         # 先以模型参数为底，再用客户端显式传入的值覆盖
         merged = {**model_config["request_params"], **request_body}
         request_body = merged
+        # 全局强制模型：最后一步覆盖 model，确保不被 request_params 或客户端值覆盖
+        request_body["model"] = effective_model
 
     # 流式响应强制包含 usage（客户端不可关闭）
     if body.stream:
@@ -411,7 +417,7 @@ async def chat_completions(
                         request_id=request_id,
                         token_record=token_record,
                         model_config=model_config,
-                        model_name=body.model,
+                        model_name=effective_model,
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         total_tokens=total_tokens,
@@ -422,7 +428,7 @@ async def chat_completions(
                     await _record_inference_audit(
                         request_id=request_id,
                         token_record=token_record,
-                        model_name=body.model,
+                        model_name=effective_model,
                         status_code=upstream_status,
                         result="success"
                         if upstream_status == 200
@@ -448,7 +454,7 @@ async def chat_completions(
                     await _record_inference_audit(
                         request_id=request_id,
                         token_record=token_record,
-                        model_name=body.model,
+                        model_name=effective_model,
                         status_code=response.status_code,
                         result="error",
                     )
@@ -471,7 +477,7 @@ async def chat_completions(
                     request_id=request_id,
                     token_record=token_record,
                     model_config=model_config,
-                    model_name=body.model,
+                    model_name=effective_model,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=total_tokens,
@@ -482,7 +488,7 @@ async def chat_completions(
                 await _record_inference_audit(
                     request_id=request_id,
                     token_record=token_record,
-                    model_name=body.model,
+                    model_name=effective_model,
                     status_code=200,
                     result="success",
                 )
@@ -498,7 +504,7 @@ async def chat_completions(
         await _record_inference_audit(
             request_id=request_id,
             token_record=token_record,
-            model_name=body.model,
+            model_name=effective_model,
             status_code=504,
             result="error",
         )
@@ -510,7 +516,7 @@ async def chat_completions(
         await _record_inference_audit(
             request_id=request_id,
             token_record=token_record,
-            model_name=body.model,
+            model_name=effective_model,
             status_code=502,
             result="error",
         )

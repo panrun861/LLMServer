@@ -52,6 +52,14 @@ class Settings(BaseSettings):
         description="只读仪表盘 token，配合 Authorization: Bearer 或 X-Dashboard-Token 使用",
     )
 
+    # 全局强制模型（单模型部署 / 客户机器）：设置后忽略客户端 model，统一路由到此模型。
+    # 值须为 LiteLLM 中已配置的模型别名，且须在 PLLM models 表中 is_current & is_enabled。
+    # 详见 docs/global-model-override-proposal.md。对应环境变量 PLLM_FORCE_MODEL。
+    force_model: str | None = Field(
+        default=None,
+        description="全局强制模型：设置后忽略客户端 model，统一路由到此模型",
+    )
+
     # 缓存配置
     models_cache_ttl: int = Field(
         default=30,
