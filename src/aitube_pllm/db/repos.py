@@ -225,12 +225,13 @@ class ModelRepo:
         row = await conn.fetchrow(
             """INSERT INTO models
                (model_name, tier, model_artifact, inference_engine, context_length,
-                api_base, runtime_params, request_params, is_current, is_enabled)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                api_base, api_key_encrypted, runtime_params, request_params, is_current, is_enabled)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                RETURNING *""",
             kwargs["model_name"], kwargs.get("tier", "medium"),
             kwargs["model_artifact"], kwargs["inference_engine"],
             kwargs["context_length"], kwargs.get("api_base"),
+            kwargs.get("api_key_encrypted"),
             kwargs.get("runtime_params"), kwargs.get("request_params"),
             kwargs.get("is_current", False), kwargs.get("is_enabled", True),
         )
@@ -306,7 +307,7 @@ class ModelRepo:
         params: list[Any] = [model_name, tier]
         idx = 3
         for key in (
-            "api_base", "runtime_params", "request_params",
+            "api_base", "api_key_encrypted", "runtime_params", "request_params",
             "is_enabled", "sync_status", "context_length", "last_synced_at",
         ):
             if key in kwargs:

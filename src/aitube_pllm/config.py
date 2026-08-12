@@ -84,6 +84,18 @@ class Settings(BaseSettings):
         description="模型列表缓存 TTL(秒)",
     )
 
+    # 加密配置（用于 api_key 等敏感字段加密存储）
+    encryption_key: str = Field(
+        default="",
+        description="AES 加密密钥（Base64 编码 32 字节），用于加密存储外部模型的 api_key",
+    )
+
+    # LiteLLM admin 配置（用于启动时动态注入外部模型）
+    litellm_admin_url: str = Field(
+        default="",
+        description="LiteLLM Proxy admin API 地址；为空时由 litellm_api_base 推导（默认同 liteLLM 地址）",
+    )
+
     model_config = {
         "env_prefix": "PLLM_",
         "env_file": ".env",

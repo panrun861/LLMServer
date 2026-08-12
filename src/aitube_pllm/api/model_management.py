@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 
 from ..db import db, ModelRepo, AuditRepo
 from ..tasks.model_sync import sync_models_from_upstream
+from ..tasks.litellm_inject import inject_single_model
+from ..utils.crypto import encrypt
 
 router = APIRouter(prefix="/admin/models", tags=["Model Management"])
 
@@ -41,22 +43,19 @@ class ModelRegisterRequest(BaseModel):
         ...,
         max_length=255,
         description=(
-            "LiteLLM 中登记的模型别名。本地 vLLM 与外部 API 统一经 LiteLLM 网关："
-            "外部 API 需先在 LiteLLM 侧注册并配置真实 api_base/key，这里只填其别名"
+            "模型标识：外部 API 时填 provider/model-name（如 openai/gpt-4o）；"
+            "本地 vLLM 时填 vLLM served name（如 qwen3.6-27b）"
         ),
     )
     inference_engine: Literal["litellm"] = Field(
         "litellm",
-        description=(
-            "统一经 LiteLLM 网关路由（本地 vLLM 与外部 API 均如此，真正的上游地址"
-            "由 LiteLLM 持有）。预留扩展位，未来可加入 direct 引擎"
-        ),
+        description="统一经 LiteLLM 网关路由。外部 API 由 PLLM 自动注入 LiteLLM",
     )
     upstream_type: Optional[Literal["local_vllm", "external_api"]] = Field(
         None,
         description=(
-            "声明上游来源：local_vllm=本机 vLLM 服务；external_api=第三方 API"
-            "（经 LiteLLM 代理）。仅作运营标记，不改变路由（均走 LiteLLM）"
+            "声明上游来源：local_vllm=本机 vLLM 服务；"
+            "external_api=第三方 API（由 PLLM 注入 LiteLLM）"
         ),
     )
     context_length: int = Field(
@@ -67,10 +66,12 @@ class ModelRegisterRequest(BaseModel):
     api_base: Optional[str] = Field(
         None,
         max_length=500,
-        description=(
-            "仅作信息记录，不参与路由（PLLM 始终经 LiteLLM）。外部 API 的真实"
-            " api_base 应配置在 LiteLLM 侧"
-        ),
+        description="外部 API 时必填：第三方 API 的基础地址（如 https://api.openai.com/v1）",
+    )
+    api_key: Optional[str] = Field(
+        None,
+        max_length=1024,
+        description="外部 API 时必填：第三方 API 的密钥（存储在 DB 中加密）",
     )
     runtime_params: Optional[dict] = None
     request_params: Optional[dict] = None
@@ -94,19 +95,36 @@ class TierActivateRequest(BaseModel):
 async def register_model(body: ModelRegisterRequest, request: Request):
     """登记新模型 (localhost CLI only)
 
-    本地 vLLM 与外部 API 统一经 LiteLLM 网关：外部 API 需在 LiteLLM 侧先注册
-    （由其持有真实 api_base/key），此处 model_artifact 填 LiteLLM 别名即可。
-    upstream_type 仅作运营标记，不改变路由。
+    - 本地 vLLM 模型：upstream_type=local_vllm，api_key 可选
+    - 外部 API 模型：upstream_type=external_api，api_base + api_key 必填
+      API key 存入 DB 时通过 AES 加密（PLLM_ENCRYPTION_KEY），并自动注入 LiteLLM
     """
     _require_local_admin(request)
 
-    # 将 upstream_type 标记并入 runtime_params（已有 JSON 列，不参与推理路由），
-    # 避免新增 DB 列带来的迁移成本。序列化为字符串写入，兼容 text/jsonb 两种列类型
-    payload = body.model_dump()
+    # 外部 API 必填字段校验
+    is_external = body.upstream_type == "external_api"
+    if is_external:
+        if not body.api_base:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="外部 API 模型必须提供 api_base",
+            )
+        if not body.api_key:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="外部 API 模型必须提供 api_key",
+            )
+
+    # 加密 api_key
+    api_key_encrypted = encrypt(body.api_key) if body.api_key else None
+
+    # 构建 payload（api_key 不入库，只存加密版本）
+    payload = body.model_dump(exclude={"api_key"})
     if body.upstream_type:
         rp = dict(payload.get("runtime_params") or {})
         rp["upstream_type"] = body.upstream_type
         payload["runtime_params"] = json.dumps(rp)
+    payload["api_key_encrypted"] = api_key_encrypted
 
     async with db.pool.acquire() as conn:
         existing = await ModelRepo.get_by_name_and_tier(conn, body.model_name, body.tier)
@@ -126,8 +144,25 @@ async def register_model(body: ModelRegisterRequest, request: Request):
             target_type="model",
             target_id=f"{body.model_name}:{body.tier}",
             result="success",
-            detail=payload,
+            detail={
+                "model_name": body.model_name,
+                "tier": body.tier,
+                "upstream_type": body.upstream_type,
+                "has_api_key": bool(body.api_key),
+            },
         )
+
+    # 自动注入 LiteLLM（仅外部 API）
+    litellm_result = None
+    if is_external and body.api_key and body.api_base:
+        litellm_data = {
+            "model_name": body.model_name,
+            "model_artifact": body.model_artifact,
+            "api_base": body.api_base,
+            "api_key": body.api_key,
+            "is_enabled": body.is_enabled,
+        }
+        litellm_result = await inject_single_model(litellm_data)
 
     return {
         "id": model["id"],
@@ -137,9 +172,11 @@ async def register_model(body: ModelRegisterRequest, request: Request):
         "inference_engine": model["inference_engine"],
         "upstream_type": _extract_upstream_type(model.get("runtime_params")),
         "context_length": model["context_length"],
+        "api_base": model["api_base"],
         "is_current": model["is_current"],
         "is_enabled": model["is_enabled"],
         "sync_status": model["sync_status"],
+        "litellm_injected": litellm_result.get("success") if litellm_result else None,
         "created_at": model["created_at"].isoformat(),
     }
 

@@ -16,6 +16,7 @@ from .api.usage_and_audit import router as usage_audit_router
 from .api.inference_gateway import router as inference_router
 from .api.dashboard import router as dashboard_router
 from .tasks.model_sync import sync_models_from_upstream
+from .tasks.litellm_inject import inject_models_to_litellm
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,16 @@ async def _periodic_model_sync() -> None:
 async def lifespan(app: FastAPI):
     """应用程序生命周期管理"""
     await db.connect()
+
+    # 注入外部 API 模型到 LiteLLM
+    try:
+        inject_result = await inject_models_to_litellm()
+        if inject_result.get("errors"):
+            logger.warning("LiteLLM 注入部分失败: %s", inject_result["errors"])
+        else:
+            logger.info("LiteLLM 注入完成: %s", inject_result)
+    except Exception:  # noqa: BLE001
+        logger.exception("LiteLLM 注入异常（应用继续启动）")
     sync_task: asyncio.Task | None = None
     if settings.model_sync_interval and settings.model_sync_interval > 0:
         sync_task = asyncio.create_task(_periodic_model_sync())

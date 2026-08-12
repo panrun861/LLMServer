@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS models (
     inference_engine VARCHAR(64) NOT NULL,
     context_length INTEGER NOT NULL,
     api_base VARCHAR(512),
+    api_key_encrypted TEXT,
     runtime_params JSONB,
     request_params JSONB,
     is_current BOOLEAN NOT NULL DEFAULT FALSE,
