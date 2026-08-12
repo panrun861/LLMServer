@@ -88,7 +88,8 @@ def _build_litellm_config(models: list[dict]) -> dict[str, Any]:
     """将模型列表转换为 LiteLLM Proxy config model_list 结构。
 
     provider 推断规则：
-    - local_vllm → ``vllm/{artifact}``，api_base 来自模型配置
+    - local_vllm → ``hosted_vllm/{artifact}``（LiteLLM 对 vLLM 的原生 provider），
+      api_base 来自模型配置（必须指向 vLLM 后端，如 http://vllm:8000/v1）
     - external_api + artifact 含 ``/`` → ``{provider}/{artifact}``（如 ``openai/gpt-4o``）
     - external_api + artifact 不含 ``/`` → default ``openai/{artifact}``
     """
@@ -103,8 +104,9 @@ def _build_litellm_config(models: list[dict]) -> dict[str, Any]:
 
         # 推断 provider 和完整 model 路径
         if upstream_type == "local_vllm":
-            # 本地 vLLM 模型，直接以 vllm/ 前缀路由
-            litellm_model = f"vllm/{artifact}"
+            # 本地 vLLM 模型，使用 LiteLLM 的 hosted_vllm provider 路由
+            # （匹配现有 litellm-config.yaml 的 hosted_vllm/qwen3.6-27b 写法）
+            litellm_model = f"hosted_vllm/{artifact}"
         elif "/" in artifact:
             provider = artifact.split("/")[0]
             litellm_model = f"{provider}/{artifact}"
