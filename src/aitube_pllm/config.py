@@ -61,6 +61,10 @@ class Settings(BaseSettings):
         default="",
         description="可选：vLLM Prometheus /metrics 地址，用于抓取真实 max_model_len 回填 context_length",
     )
+    model_sync_vllm_models_url: str = Field(
+        default="",
+        description="vLLM 原生 /v1/models 地址（含真实 max_model_len），如 http://host.docker.internal:8000/v1/models；为空则不抓取",
+    )
     model_sync_interval: int = Field(
         default=300,
         description="周期同步间隔(秒)，0=关闭后台自动同步（仍可用 POST /admin/models/sync 手动触发）",

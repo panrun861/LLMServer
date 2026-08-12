@@ -90,6 +90,40 @@ async def fetch_vllm_max_model_len() -> dict[str, int]:
     return result
 
 
+async def fetch_vllm_models() -> dict[str, int]:
+    """从 vLLM 原生 /v1/models 抓取真实 max_model_len。
+
+    vLLM（含 0.25.1）的 /v1/models 每个模型对象直接带 ``max_model_len`` 字段，
+    这是真实上下文窗口长度（如 310000），比 LiteLLM 透传的 /v1/models 更权威
+    （LiteLLM 透传会丢失该字段）。
+
+    注意：该端点的 model id 是 vLLM 的 served name（如 ``qwen3.6-27b``），与 PLLM
+    的 ``model_name``（LiteLLM 别名，如 ``qwen3.6-local``）可能不同，匹配时需用
+    ``model_artifact`` 去前缀桥接（见 ``_resolve_context_length``）。
+
+    返回 {served_model_name: max_model_len}。抓取失败返回空 dict（best-effort）。
+    """
+    url = settings.model_sync_vllm_models_url
+    if not url:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("抓取 vLLM /v1/models 失败，context_length 将不自动更新: %s", exc)
+        return {}
+
+    result: dict[str, int] = {}
+    for m in payload.get("data", []):
+        served = m.get("id")
+        ml = m.get("max_model_len")
+        if served and ml is not None:
+            result[served] = int(ml)
+    return result
+
+
 def _match_upstream(model: dict, upstream_ids: set[str]) -> str | None:
     """判断已登记模型是否在上游列表中，返回命中的上游 id（未命中返回 None）。
 
@@ -105,6 +139,27 @@ def _match_upstream(model: dict, upstream_ids: set[str]) -> str | None:
     return None
 
 
+def _resolve_context_length(model: dict, max_len_map: dict[str, int]) -> int | None:
+    """从 max_len_map 中按候选 key 解析真实上下文长度。
+
+    候选 key 优先级：model_name（LiteLLM 别名）> model_artifact（可能带 provider
+    前缀，如 ``openai/qwen3.6-27b``）> model_artifact 去前缀
+    （``qwen3.6-27b``，匹配 vLLM served name）。首个命中即返回；均未命中返回 None。
+    """
+    name = model.get("model_name")
+    artifact = model.get("model_artifact")
+    candidates: list[str] = []
+    if name:
+        candidates.append(name)
+    if artifact:
+        candidates.append(artifact)
+        candidates.append(artifact.split("/")[-1])
+    for key in candidates:
+        if key and key in max_len_map:
+            return max_len_map[key]
+    return None
+
+
 async def sync_models_from_upstream() -> dict:
     """执行一次同步，回写 models 表。返回摘要。"""
     upstream = await fetch_upstream_models()
@@ -114,6 +169,9 @@ async def sync_models_from_upstream() -> dict:
     for m in upstream:
         if m.get("max_model_len"):
             max_len_map[m["id"]] = int(m["max_model_len"])
+    # vLLM 原生 /v1/models 是真实 max_model_len 的权威来源（优先级高）
+    max_len_map.update(await fetch_vllm_models())
+    # vLLM Prometheus metrics（0.25.1 无此指标，保留兼容 best-effort）
     max_len_map.update(await fetch_vllm_max_model_len())
 
     summary = {
@@ -132,8 +190,9 @@ async def sync_models_from_upstream() -> dict:
                 update: dict[str, Any] = {"sync_status": "synced"}
                 if settings.model_sync_disable_missing:
                     update["is_enabled"] = True
-                if matched_id in max_len_map:
-                    update["context_length"] = max_len_map[matched_id]
+                ctx = _resolve_context_length(model, max_len_map)
+                if ctx:
+                    update["context_length"] = ctx
                 update["last_synced_at"] = datetime.now(timezone.utc)
                 await ModelRepo.update_row(
                     conn, model["model_name"], model["tier"], **update
