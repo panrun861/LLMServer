@@ -26,3 +26,6 @@ API_TEST_REPORT.md
 run_api_tests.py
 tests/prefix_test.py
 tests/API_TEST_REPORT_2026-07-29.md
+
+# WorkBuddy project memory (agent-internal data, not for git)
+.workbuddy/
