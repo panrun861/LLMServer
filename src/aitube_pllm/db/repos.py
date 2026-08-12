@@ -305,7 +305,10 @@ class ModelRepo:
         sets: list[str] = ["updated_at = NOW()"]
         params: list[Any] = [model_name, tier]
         idx = 3
-        for key in ("api_base", "runtime_params", "request_params", "is_enabled", "sync_status"):
+        for key in (
+            "api_base", "runtime_params", "request_params",
+            "is_enabled", "sync_status", "context_length", "last_synced_at",
+        ):
             if key in kwargs:
                 sets.append(f"{key} = ${idx}")
                 params.append(kwargs[key])

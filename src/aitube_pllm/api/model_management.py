@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from ..db import db, ModelRepo, AuditRepo
+from ..tasks.model_sync import sync_models_from_upstream
 
 router = APIRouter(prefix="/admin/models", tags=["Model Management"])
 
@@ -81,6 +82,46 @@ async def register_model(body: ModelRegisterRequest, request: Request):
         "is_enabled": model["is_enabled"],
         "sync_status": model["sync_status"],
         "created_at": model["created_at"].isoformat(),
+    }
+
+
+@router.post("/sync", status_code=status.HTTP_200_OK)
+async def sync_models(request: Request):
+    """从上游(LiteLLM/vLLM)同步模型可用状态与上下文长度到 models 表 (localhost CLI only)
+
+    行为：
+    - 上游存在且已登记的模型 -> sync_status='synced'，刷新 is_enabled/context_length
+    - 上游不存在的已登记模型 -> sync_status='failed'，并按配置置 is_enabled=False
+    - 若上游整体不可达，返回 502，不做批量禁用
+    """
+    _require_local_admin(request)
+
+    try:
+        result = await sync_models_from_upstream()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"模型同步失败（上游不可达或返回异常）: {exc}",
+        )
+
+    async with db.pool.acquire() as conn:
+        await AuditRepo.record_event(
+            conn,
+            actor_type="admin_cli",
+            actor_id="localhost",
+            action="model_sync",
+            target_type="model",
+            target_id="all",
+            result="success",
+            detail=result,
+        )
+
+    return {
+        "synced": result["synced"],
+        "failed": result["failed"],
+        "created": result["created"],
+        "upstream_models": result["upstream_models"],
+        "errors": result["errors"],
     }
 
 

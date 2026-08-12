@@ -52,6 +52,28 @@ class Settings(BaseSettings):
         description="只读仪表盘 token，配合 Authorization: Bearer 或 X-Dashboard-Token 使用",
     )
 
+    # 模型同步配置（将上游 LiteLLM/vLLM 真实可用状态/上下文长度回写 models 表）
+    model_sync_upstream_url: str = Field(
+        default="",
+        description="同步用的上游 /v1/models 地址；为空时由 litellm_api_base 推导",
+    )
+    model_sync_vllm_metrics_url: str = Field(
+        default="",
+        description="可选：vLLM Prometheus /metrics 地址，用于抓取真实 max_model_len 回填 context_length",
+    )
+    model_sync_interval: int = Field(
+        default=300,
+        description="周期同步间隔(秒)，0=关闭后台自动同步（仍可用 POST /admin/models/sync 手动触发）",
+    )
+    model_sync_disable_missing: bool = Field(
+        default=True,
+        description="上游列表中存在但 PLLM 未登记的模型，同步时是否将其 is_enabled 置为 False",
+    )
+    model_sync_auto_create: bool = Field(
+        default=False,
+        description="是否自动登记『上游存在但 PLLM 未登记』的模型（默认关闭，避免误建）",
+    )
+
     # 缓存配置
     models_cache_ttl: int = Field(
         default=30,
