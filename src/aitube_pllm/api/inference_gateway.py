@@ -282,10 +282,6 @@ async def chat_completions(
     request_id = uuid.uuid4()
     start_time = time.time()
 
-    # 全局强制模型（PLLM_FORCE_MODEL）：设置后忽略客户端 model，统一路由到此模型；
-    # 未设置时退回客户端传入的 body.model。详见 docs/global-model-override-proposal.md。
-    effective_model = settings.force_model or body.model
-
     # X-Correlation-Id 长度校验（设计文档 §1.3: 超过 255 字符返回 422）
     correlation_id = request.headers.get("x-correlation-id")
     if correlation_id is not None and len(correlation_id) > 255:
@@ -296,6 +292,12 @@ async def chat_completions(
 
     # 从数据库查询模型配置
     async with db.pool.acquire() as conn:
+        # 全局当前模型取自 models 表 is_current 标记（持久化在 DB，切换全局模型只需改
+        # is_current，无需改 env / 重建容器）。存在 current 模型时统一路由到它（忽略客户端
+        # model）；不存在时退回客户端传入的 body.model。
+        global_model = await ModelRepo.get_current_model_name(conn)
+        effective_model = global_model or body.model
+
         model_config = await ModelRepo.get_current(conn, effective_model)
         if not model_config:
             raise HTTPException(

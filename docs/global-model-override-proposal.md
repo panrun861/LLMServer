@@ -1,7 +1,11 @@
 # PLLM 全局模型强制路由 — 方案书
 
 > 目标：新增“全局强制模型”参数。设置后，**不论 OpenAI 接口客户端传入什么 `model` 名称，统一路由到唯一指定的当前可用模型**。
-> 状态：方案阶段（未落地代码）。适用场景：单模型部署 / 客户机器。
+> 状态：**已落地（2026-08-12）**。适用场景：单模型部署 / 客户机器。
+
+> **实现说明（已变更）**：最终未采用 `PLLM_FORCE_MODEL` 环境变量方案，而是直接复用 `models` 表的 `is_current` 标记作为全局当前模型——
+> 网关在每次请求时读取 `WHERE is_current=TRUE AND is_enabled=TRUE` 的 `model_name` 作为强制目标（见 `ModelRepo.get_current_model_name`）。
+> 切换全局模型只需改 `models.is_current`（或调 `/admin/models/{name}/active-tier`），**无需改 `.env`、无需重建容器**。原 `config.py` 的 `force_model` 字段已删除。
 
 ---
 

@@ -254,6 +254,17 @@ class ModelRepo:
         )
 
     @staticmethod
+    async def get_current_model_name(conn: asyncpg.Connection) -> str | None:
+        """返回全局当前模型名：models 表中 is_current 且 is_enabled 的行。
+        若多个 model_name 各自持有 current tier，取最近更新（updated_at DESC）的一个。
+        无 current 模型时返回 None（此时网关退回客户端 body.model）。"""
+        return await conn.fetchval(
+            """SELECT model_name FROM models
+               WHERE is_current = TRUE AND is_enabled = TRUE
+               ORDER BY updated_at DESC, id DESC LIMIT 1"""
+        )
+
+    @staticmethod
     async def list_all(
         conn: asyncpg.Connection,
         model_name: str | None = None,
