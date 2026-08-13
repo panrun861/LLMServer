@@ -323,8 +323,12 @@ class ModelRepo:
             "is_enabled", "sync_status", "context_length", "last_synced_at",
         ):
             if key in kwargs:
+                val = kwargs[key]
+                # JSON 列统一 json.dumps 序列化为字符串，兼容 TEXT/JSONB（asyncpg 两种列都期望 str）
+                if key in ("runtime_params", "request_params") and val is not None and not isinstance(val, str):
+                    val = json.dumps(val)
                 sets.append(f"{key} = ${idx}")
-                params.append(kwargs[key])
+                params.append(val)
                 idx += 1
         return await conn.fetchrow(
             f"""UPDATE models SET {', '.join(sets)}
