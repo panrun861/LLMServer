@@ -49,6 +49,13 @@
   .ok-msg { color:var(--ok); padding:8px 0; font-size:13px; }
   .meta { color:var(--muted); font-size:12px; }
   .scroll { max-height:360px; overflow:auto; }
+  .ts-chart { display:flex; align-items:flex-end; gap:4px; height:150px; padding:10px 4px 0; }
+  .tsbar { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; height:100%; min-width:0; }
+  .tsbar-fill { width:75%; background:var(--accent); border-radius:3px 3px 0 0; min-height:2px; }
+  .tsbar-val { font-size:10px; color:var(--muted); margin-top:3px; }
+  .tsbar-label { font-size:9px; color:var(--muted); white-space:nowrap; transform:rotate(-45deg); transform-origin:left center; margin-top:4px; }
+  .bar-meter { background:#0c111c; border:1px solid var(--line); border-radius:999px; height:8px; overflow:hidden; margin-top:4px; }
+  .bar-meter > i { display:block; height:100%; background:var(--accent); }
   /* config */
   #config { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
   #config.collapsed .cfg-body { display:none; }
@@ -167,6 +174,35 @@
             <div id="healthBlock" class="meta"></div>
             <div id="inferenceBlock" class="meta" style="margin-top:10px;"></div>
           </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>用量统计（24h）</h2>
+        <div id="usageKpis" class="row"></div>
+      </div>
+
+      <div class="grid2">
+        <div class="panel">
+          <h2>请求趋势</h2>
+          <div id="timeseriesChart"></div>
+        </div>
+        <div class="panel">
+          <h2>按模型 / 按主体</h2>
+          <div class="scroll" style="max-height:200px;"><table id="byModelTable"></table></div>
+          <h2 style="margin-top:14px;">按主体</h2>
+          <div class="scroll" style="max-height:200px;"><table id="bySubjectTable"></table></div>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div class="panel">
+          <h2>Token 预算</h2>
+          <div class="scroll"><table id="budgetTable"></table></div>
+        </div>
+        <div class="panel">
+          <h2>最近请求</h2>
+          <div class="scroll"><table id="recentUsageTable"></table></div>
         </div>
       </div>
     </section>
@@ -442,6 +478,74 @@ function renderSnapshot(d){
   } else {
     $("inferenceBlock").innerHTML = `<div class="meta">推理并发监控不可用${inf.error?"："+esc(inf.error):""}</div>`;
   }
+  renderUsage(d);
+}
+
+function renderUsage(d){
+  const t = (d && d.totals) || {};
+  const lat = (d && d.latency) || {};
+  $("usageKpis").innerHTML = `
+    <div class="kpi"><div class="label">请求数</div><div class="value">${fmt(t.requests)}</div></div>
+    <div class="kpi"><div class="label">成功 / 失败</div><div class="value">${fmt(t.success)}<span style="font-size:14px;color:var(--muted)"> / ${fmt(t.failed)}</span></div></div>
+    <div class="kpi"><div class="label">错误率</div><div class="value" style="color:${(t.error_rate||0)>0?'var(--bad)':'var(--ok)'}">${((t.error_rate||0)*100).toFixed(2)}%</div></div>
+    <div class="kpi"><div class="label">总 Token</div><div class="value">${fmt(t.total_tokens)}</div></div>
+    <div class="kpi"><div class="label">延迟 avg/p95/p99</div><div class="value" style="font-size:14px">${lat.avg_ms||0}/${lat.p95_ms||0}/${lat.p99_ms||0} ms</div></div>`;
+  renderTimeseries((d && d.timeseries) || []);
+  renderByModel((d && d.by_model) || []);
+  renderBySubject((d && d.by_subject) || []);
+  renderBudgets((d && d.budgets) || []);
+  renderRecentUsage((d && d.recent_usage) || []);
+}
+
+function renderTimeseries(ts){
+  if(!ts.length){ $("timeseriesChart").innerHTML = `<div class="meta">暂无请求数据</div>`; return; }
+  const maxReq = Math.max(...ts.map(x=>x.requests), 1);
+  const bars = ts.map(x=>{
+    const h = Math.max(Math.round(x.requests/maxReq*100), 2);
+    const label = String(x.bucket||"").replace("T"," ").replace(/(\d{4}-\d{2}-\d{2}) (\d{2}):.*/, "$2时");
+    return `<div class="tsbar" title="${esc(x.bucket)}  请求=${x.requests}  token=${x.tokens} 错误=${x.errors}"><div class="tsbar-fill" style="height:${h}%"></div><span class="tsbar-val">${x.requests}</span><span class="tsbar-label">${esc(label)}</span></div>`;
+  }).join("");
+  $("timeseriesChart").innerHTML = `<div class="ts-chart">${bars}</div>`;
+}
+
+function renderByModel(items){
+  if(!items.length){ $("byModelTable").innerHTML = `<tr><td class="meta">暂无数据</td></tr>`; return; }
+  let html = `<tr><th>模型</th><th>请求</th><th>Token</th><th>avg延迟</th><th>错误</th></tr>`;
+  items.forEach(r=>{
+    html += `<tr><td class="wrap2">${esc(r.model)}</td><td>${fmt(r.requests)}</td><td>${fmt(r.tokens)}</td><td>${r.avg_latency_ms}ms</td><td>${r.errors>0?`<span style="color:var(--bad)">${r.errors}</span>`:r.errors}</td></tr>`;
+  });
+  $("byModelTable").innerHTML = html;
+}
+
+function renderBySubject(items){
+  if(!items.length){ $("bySubjectTable").innerHTML = `<tr><td class="meta">暂无数据</td></tr>`; return; }
+  let html = `<tr><th>主体</th><th>请求</th><th>Token</th><th>avg延迟</th><th>错误率</th></tr>`;
+  items.forEach(r=>{
+    html += `<tr><td class="wrap2">${esc(r.subject)}</td><td>${fmt(r.requests)}</td><td>${fmt(r.tokens)}</td><td>${r.avg_latency_ms}ms</td><td>${((r.error_rate||0)*100).toFixed(1)}%</td></tr>`;
+  });
+  $("bySubjectTable").innerHTML = html;
+}
+
+function renderBudgets(items){
+  if(!items.length){ $("budgetTable").innerHTML = `<tr><td class="meta">暂无预算数据</td></tr>`; return; }
+  let html = `<tr><th>主体</th><th>名称</th><th>额度</th><th>已用</th><th>剩余</th><th>状态</th></tr>`;
+  items.forEach(b=>{
+    const pct = b.pct!=null ? b.pct : 0;
+    const meter = b.pct!=null ? `<div class="bar-meter"><i style="width:${Math.min(pct,100)}%;background:${b.status==='exhausted'?'var(--bad)':b.status==='warning'?'var(--warn)':'var(--accent)'}"></i></div>` : `<span class="meta">不限</span>`;
+    const stTag = b.status==='ok' ? '<span class="tag ok">ok</span>' : b.status==='warning' ? '<span class="tag warn">warning</span>' : b.status==='exhausted' ? '<span class="tag bad">exhausted</span>' : '<span class="tag muted">unlimited</span>';
+    html += `<tr><td>${esc(b.subject)}</td><td>${esc(b.name||"–")}</td><td>${b.token_budget!=null?fmt(b.token_budget):"–"}${b.token_budget_period?"/"+esc(b.token_budget_period):""}</td><td>${fmt(b.used)}</td><td>${b.remaining!=null?fmt(b.remaining):"–"}</td><td>${stTag}${meter}</td></tr>`;
+  });
+  $("budgetTable").innerHTML = html;
+}
+
+function renderRecentUsage(items){
+  if(!items.length){ $("recentUsageTable").innerHTML = `<tr><td class="meta">暂无请求</td></tr>`; return; }
+  let html = `<tr><th>时间</th><th>模型</th><th>主体</th><th>Token</th><th>延迟</th><th>状态</th></tr>`;
+  items.forEach(r=>{
+    const sc = r.status_code<400 ? `<span class="tag ok">${r.status_code}</span>` : `<span class="tag bad">${r.status_code}</span>`;
+    html += `<tr><td>${esc((r.created_at||"").replace("T"," ").slice(0,19))}</td><td class="wrap2">${esc(r.model)}</td><td>${esc(r.subject)}</td><td>${fmt(r.total_tokens)}</td><td>${r.latency_ms}ms</td><td>${sc}</td></tr>`;
+  });
+  $("recentUsageTable").innerHTML = html;
 }
 function fmtUptime(s){ if(s==null) return "–"; s=Math.floor(s); const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60); return (d>0?d+"天 ":"")+h+"时"+m+"分"; }
 

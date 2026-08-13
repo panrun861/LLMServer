@@ -338,11 +338,24 @@ async def update_model(model_name: str, tier: str, body: ModelUpdateRequest, req
             detail={"old": old, "new": update_fields},
         )
 
+    # 更新后重新注入 LiteLLM（api_base / 启用状态需在 LiteLLM 侧同步生效）
+    litellm_result = None
+    try:
+        litellm_result = await inject_single_model({"model_name": model_name})
+    except Exception as exc:  # noqa: BLE001
+        litellm_result = {"success": False, "error": str(exc)}
+
+    litellm_note = None
+    if litellm_result:
+        litellm_note = litellm_result.get("removed") or litellm_result.get("note")
+
     return {
         "id": updated["id"],
         "model_name": updated["model_name"],
         "tier": updated["tier"],
         "updated_at": updated["updated_at"].isoformat(),
+        "litellm_injected": litellm_result.get("success") if litellm_result else None,
+        "litellm_note": litellm_note,
     }
 
 

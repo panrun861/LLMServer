@@ -264,7 +264,15 @@ async def inject_models_to_litellm() -> dict[str, Any]:
 
 
 async def inject_single_model(model_data: dict) -> dict[str, Any]:
-    """注册新模型后触发单模型重注入（确保 LiteLLM 与 PLLM 数据库一致）。"""
+    """单模型重注入（删除 LiteLLM 旧条目 + 按最新 DB 配置重新注册），确保 LiteLLM 与 PLLM DB 一致。
+
+    用于注册后（无旧条目，等价于直接注册）与更新后（改 api_base / 启用状态等）两种场景：
+    - is_enabled=True：删除该 model_name 在 LiteLLM 的旧条目后重新 /model/new。
+    - is_enabled=False：仅删除旧条目（从 LiteLLM 移除），不再注册。
+
+    注：LiteLLM 1.92 的 /model/new 对已存在 model_name 会累加重复条目而非覆盖，
+    故必须先按 model_info.id 删除旧条目（/model/info 实际在 model_info.id 里返回 id）。
+    """
     all_models = await fetch_all_registered_models()
     target = next(
         (m for m in all_models if m["model_name"] == model_data.get("model_name")),
@@ -274,8 +282,30 @@ async def inject_single_model(model_data: dict) -> dict[str, Any]:
         return {"success": True, "note": "model not in injectable list"}
 
     admin_url = _resolve_litellm_admin_url()
-    payload = _model_new_payload(target)
     async with httpx.AsyncClient(timeout=15.0) as client:
+        # 1) 删除该 model_name 在 LiteLLM 中的全部旧条目（按 model_info.id）
+        try:
+            existing = await _get_existing_models(client, admin_url)
+            for e in existing:
+                if e.get("model_name") != target["model_name"]:
+                    continue
+                mid = (e.get("model_info") or {}).get("id")
+                if not mid:
+                    continue
+                await client.post(
+                    f"{admin_url}/model/delete",
+                    json={"id": mid},
+                    headers=_auth_header(),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("删除旧模型条目失败（继续注册）: %s", exc)
+
+        # 2) 禁用模型：仅删除，不重新注册
+        if not target.get("is_enabled"):
+            return {"success": True, "removed": target["model_name"]}
+
+        # 3) 启用模型：按最新配置重新注册
+        payload = _model_new_payload(target)
         try:
             resp = await client.post(
                 f"{admin_url}/model/new",
