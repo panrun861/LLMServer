@@ -275,17 +275,18 @@
 <script>
 "use strict";
 const LS = { base:"pllm_base", token:"pllm_token", dtoken:"pllm_dtoken" };
+const DEFAULT_DTOKEN = "pllm_dash_sTq2jdQERFiZF9PWZgVIMxCenXW6jiCI"; // 内网默认仪表盘令牌，可在配置里覆盖
 function cfg(){
   return {
     base: (localStorage.getItem(LS.base) || "http://35.76.187.215:8080").replace(/\/+$/,""),
     token: localStorage.getItem(LS.token) || "",
-    dtoken: localStorage.getItem(LS.dtoken) || ""
+    dtoken: localStorage.getItem(LS.dtoken) || DEFAULT_DTOKEN
   };
 }
 function loadCfgInputs(){
   document.getElementById("cfgBase").value = localStorage.getItem(LS.base) || "http://35.76.187.215:8080";
   document.getElementById("cfgToken").value = localStorage.getItem(LS.token) || "";
-  document.getElementById("cfgDToken").value = localStorage.getItem(LS.dtoken) || "";
+  document.getElementById("cfgDToken").value = localStorage.getItem(LS.dtoken) || DEFAULT_DTOKEN;
 }
 function saveCfg(){
   localStorage.setItem(LS.base, document.getElementById("cfgBase").value.trim());
