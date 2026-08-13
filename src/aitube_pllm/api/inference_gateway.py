@@ -337,9 +337,16 @@ async def chat_completions(
 
     # 构造请求体：模型 request_params 作为默认值，客户端参数优先覆盖
     request_body = body.model_dump(exclude_none=True)
-    if model_config["request_params"]:
+    rp = model_config.get("request_params")
+    if isinstance(rp, str):
+        # asyncpg 读 jsonb 列默认返回 JSON 字符串，需先反序列化为 dict
+        try:
+            rp = json.loads(rp)
+        except (ValueError, TypeError):
+            rp = None
+    if rp:
         # 先以模型参数为底，再用客户端显式传入的值覆盖
-        merged = {**model_config["request_params"], **request_body}
+        merged = {**rp, **request_body}
         request_body = merged
     # 全局强制模型：无条件覆盖 model，确保不被 request_params 或客户端值覆盖
     request_body["model"] = effective_model
