@@ -213,6 +213,7 @@
         <h2>模型管理</h2>
         <div class="cfg-actions">
           <button class="primary" id="modelsRefresh">刷新</button>
+          <button class="primary" id="modelsRegister">注册模型</button>
           <button id="modelsSync">同步模型 (POST /sync)</button>
           <span id="modelsMsg" class="meta"></span>
         </div>
@@ -307,6 +308,45 @@
     <div class="acts">
       <button id="issueCancel">取消</button>
       <button class="primary" id="issueSave">签发</button>
+    </div>
+  </div>
+</div>
+
+<!-- 注册模型弹窗 -->
+<div class="modal-bg" id="registerModal">
+  <div class="modal">
+    <h3>注册新模型</h3>
+    <label>model_name（必填，模型唯一名）</label>
+    <input id="regName" type="text" placeholder="例如 qwen3-8b" />
+    <label>model_artifact（必填，模型标识）</label>
+    <input id="regArtifact" type="text" placeholder="外部 API 填 Qwen/Qwen3-8B；本地 vLLM 填 served name" />
+    <label>upstream_type（上游类型）</label>
+    <select id="regUpstream">
+      <option value="local_vllm">local_vllm（本地 vLLM）</option>
+      <option value="external_api">external_api（第三方 API）</option>
+    </select>
+    <label>context_length（必填，上下文长度）</label>
+    <input id="regContext" type="text" placeholder="例如 128000" />
+    <label>api_base（external_api 必填）</label>
+    <input id="regApiBase" type="text" placeholder="https://api.siliconflow.cn/v1" />
+    <label>api_key（external_api 必填，AES 加密入库）</label>
+    <input id="regApiKey" type="password" placeholder="sk-..." />
+    <label>tier（档位，默认 medium）</label>
+    <input id="regTier" type="text" placeholder="medium" />
+    <label>runtime_params（JSON，可选）</label>
+    <textarea id="regRuntime" placeholder='{}'></textarea>
+    <label>request_params（JSON，可选）</label>
+    <textarea id="regRequest" placeholder='{}'></textarea>
+    <label>is_enabled（默认启用）</label>
+    <select id="regEnabled">
+      <option value="true">true（启用）</option>
+      <option value="false">false（禁用）</option>
+    </select>
+    <div id="regErr" class="err"></div>
+    <div id="regOk" class="ok-msg"></div>
+    <div class="acts">
+      <button id="regCancel">取消</button>
+      <button class="primary" id="regSave">注册 (POST)</button>
     </div>
   </div>
 </div>
@@ -616,6 +656,44 @@ $("modelsSync").onclick = async ()=>{
     $("modelsMsg").textContent = `同步完成：synced=${r.synced}, failed=${r.failed}, created=${r.created} ✓`;
     await refreshModels();
   } catch(e){ $("modelsErr").textContent = "同步失败: " + e.message; }
+};
+
+$("modelsRegister").onclick = ()=> $("registerModal").classList.add("show");
+$("regCancel").onclick = ()=> $("registerModal").classList.remove("show");
+$("regSave").onclick = async ()=>{
+  $("regErr").textContent = ""; $("regOk").textContent = "";
+  const name = $("regName").value.trim();
+  const artifact = $("regArtifact").value.trim();
+  const upstream = $("regUpstream").value;
+  const ctx = $("regContext").value.trim();
+  if(!name){ $("regErr").textContent = "model_name 必填"; return; }
+  if(!artifact){ $("regErr").textContent = "model_artifact 必填"; return; }
+  if(!ctx || !Number(ctx)){ $("regErr").textContent = "context_length 必填且为数字"; return; }
+  const apiBase = $("regApiBase").value.trim();
+  const apiKey = $("regApiKey").value.trim();
+  if(upstream === "external_api" && (!apiBase || !apiKey)){ $("regErr").textContent = "external_api 必须填 api_base 和 api_key"; return; }
+  let runtime=null, request=null;
+  try { runtime = $("regRuntime").value.trim() ? JSON.parse($("regRuntime").value) : null; }
+  catch(e){ $("regErr").textContent = "runtime_params 不是合法 JSON"; return; }
+  try { request = $("regRequest").value.trim() ? JSON.parse($("regRequest").value) : null; }
+  catch(e){ $("regErr").textContent = "request_params 不是合法 JSON"; return; }
+  const body = {
+    model_name: name,
+    model_artifact: artifact,
+    upstream_type: upstream,
+    context_length: Number(ctx),
+    api_base: apiBase || null,
+    api_key: apiKey || null,
+    tier: $("regTier").value.trim() || "medium",
+    runtime_params: runtime,
+    request_params: request,
+    is_enabled: $("regEnabled").value === "true"
+  };
+  try {
+    const r = await api("/admin/models", {method:"POST", auth:"admin", body});
+    $("regOk").textContent = "已注册 ✓ " + name + (r.litellm_injected ? "（LiteLLM 注入成功）" : "（注入未确认）");
+    await refreshModels();
+  } catch(e){ $("regErr").textContent = "注册失败: " + e.message; }
 };
 
 // edit modal
