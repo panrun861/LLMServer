@@ -102,6 +102,7 @@ class ModelRegisterRequest(BaseModel):
 
 class ModelUpdateRequest(BaseModel):
     api_base: Optional[str] = Field(None, max_length=500)
+    api_key: Optional[str] = Field(None, max_length=1024)
     runtime_params: Optional[dict] = None
     request_params: Optional[dict] = None
     is_enabled: Optional[bool] = None
@@ -318,6 +319,9 @@ async def update_model(model_name: str, tier: str, body: ModelUpdateRequest, req
             )
 
         update_fields = body.model_dump(exclude_none=True)
+        # api_key 需 AES 加密后写入 api_key_encrypted（明文不入库、不入审计）
+        if "api_key" in update_fields:
+            update_fields["api_key_encrypted"] = encrypt(update_fields.pop("api_key"))
         if not update_fields:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -327,6 +331,9 @@ async def update_model(model_name: str, tier: str, body: ModelUpdateRequest, req
         old = {k: model.get(k) for k in update_fields}
         updated = await ModelRepo.update_row(conn, model_name, tier, **update_fields)
 
+        # 审计不落明文/密文 key
+        audit_old = {k: (v if k != "api_key_encrypted" else "<encrypted>") for k, v in old.items()}
+        audit_new = {k: (v if k != "api_key_encrypted" else "<encrypted>") for k, v in update_fields.items()}
         await AuditRepo.record_event(
             conn,
             actor_type="admin_cli",
@@ -335,7 +342,7 @@ async def update_model(model_name: str, tier: str, body: ModelUpdateRequest, req
             target_type="model",
             target_id=f"{model_name}:{tier}",
             result="success",
-            detail={"old": old, "new": update_fields},
+            detail={"old": audit_old, "new": audit_new},
         )
 
     # 更新后重新注入 LiteLLM（api_base / 启用状态需在 LiteLLM 侧同步生效）

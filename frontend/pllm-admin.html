@@ -263,6 +263,9 @@
     <h3 id="editTitle">编辑模型参数</h3>
     <label>API Base（后端地址，external_api 必填）</label>
     <input id="editApiBase" type="text" placeholder="https://... 或 http://host:8000/v1" />
+    <label>API Key（后端密钥，external_api 必填；留空 = 不修改）</label>
+    <input id="editApiKey" type="password" placeholder="留空表示保持原 key 不变" />
+    <div id="editApiKeyHint" class="hint" style="display:none;"></div>
     <label>启用 (is_enabled)</label>
     <input id="editEnabled" type="text" placeholder="true / false" />
     <label>runtime_params（JSON 对象，运行时参数）</label>
@@ -622,6 +625,10 @@ function openEdit(name, tier){
   const m = _modelsCache.find(x=>x.model_name===name && x.tier===tier) || {};
   $("editTitle").textContent = `编辑参数：${name}:${tier}`;
   $("editApiBase").value = m.api_base || "";
+  $("editApiKey").value = "";
+  const keyHint = $("editApiKeyHint");
+  if (m.api_key_masked) { keyHint.textContent = "当前 key：" + m.api_key_masked; keyHint.style.display = "block"; }
+  else { keyHint.textContent = ""; keyHint.style.display = "none"; }
   $("editEnabled").value = m.is_enabled===false ? "false" : "true";
   $("editRuntime").value = m.runtime_params && typeof m.runtime_params==="object" ? JSON.stringify(m.runtime_params,null,2) : (typeof m.runtime_params==="string"?m.runtime_params:"{}");
   $("editRequest").value = m.request_params ? JSON.stringify(m.request_params,null,2) : "{}";
@@ -645,6 +652,8 @@ $("editSave").onclick = async ()=>{
     runtime_params: runtime,
     request_params: request
   };
+  const apiKey = $("editApiKey").value.trim();
+  if (apiKey) body.api_key = apiKey;
   try {
     await api(`/admin/models/${encodeURIComponent(_editTarget.name)}/tiers/${encodeURIComponent(_editTarget.tier)}`,
       {method:"PATCH", auth:"admin", body});
