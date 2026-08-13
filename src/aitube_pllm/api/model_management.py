@@ -322,6 +322,20 @@ async def update_model(model_name: str, tier: str, body: ModelUpdateRequest, req
         # api_key 需 AES 加密后写入 api_key_encrypted（明文不入库、不入审计）
         if "api_key" in update_fields:
             update_fields["api_key_encrypted"] = encrypt(update_fields.pop("api_key"))
+        # 保护 upstream_type：编辑 runtime_params 时若未显式指定，保留旧值，
+        # 避免注入 LiteLLM 时因丢失 upstream_type 被误判为 local_vllm。
+        if update_fields.get("runtime_params") is not None:
+            new_rp = update_fields["runtime_params"]
+            if isinstance(new_rp, dict):
+                old_rp = model.get("runtime_params")
+                if isinstance(old_rp, str):
+                    try:
+                        old_rp = json.loads(old_rp)
+                    except (ValueError, TypeError):
+                        old_rp = None
+                old_upstream = (old_rp or {}).get("upstream_type")
+                if old_upstream and not new_rp.get("upstream_type"):
+                    update_fields["runtime_params"] = {**new_rp, "upstream_type": old_upstream}
         if not update_fields:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
