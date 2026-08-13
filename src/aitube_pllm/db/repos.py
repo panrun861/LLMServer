@@ -46,6 +46,15 @@ class IssuerRepo:
             issuer_id, key_id, public_key,
         )
 
+    @staticmethod
+    async def list_all(conn: asyncpg.Connection) -> list[dict]:
+        """列出全部已注册签发者（仅元数据，不含完整公钥明文）。"""
+        rows = await conn.fetch(
+            """SELECT issuer_id, key_id, is_active, created_at
+               FROM issuers ORDER BY created_at DESC"""
+        )
+        return [dict(r) for r in rows]
+
 
 class NonceRepo:
     """Nonce 仓库"""

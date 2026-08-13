@@ -133,6 +133,7 @@
   <nav class="tabs">
     <button data-tab="status" class="active">状态总览</button>
     <button data-tab="models">模型管理</button>
+    <button data-tab="keys">密钥与令牌</button>
     <button data-tab="chat">对话测试</button>
   </nav>
 
@@ -184,6 +185,25 @@
       </div>
     </section>
 
+    <!-- ============ 密钥与令牌 ============ -->
+    <section id="tab-keys">
+      <div class="panel">
+        <h2>PLLM Token</h2>
+        <div class="cfg-actions">
+          <button class="primary" id="keysRefresh">刷新</button>
+          <button id="keysIssueBtn">签发新 Token</button>
+          <span id="keysMsg" class="meta"></span>
+        </div>
+        <div id="keysErr" class="err"></div>
+        <div class="scroll"><table id="tokenTable"></table></div>
+      </div>
+      <div class="panel">
+        <h2>签发 Key（Ed25519 签发者）</h2>
+        <div id="issuerErr" class="err"></div>
+        <div class="scroll"><table id="issuerTable"></table></div>
+      </div>
+    </section>
+
     <!-- ============ 对话 ============ -->
     <section id="tab-chat">
       <div class="panel">
@@ -218,6 +238,36 @@
     <div class="acts">
       <button id="editCancel">取消</button>
       <button class="primary" id="editSave">保存 (PATCH)</button>
+    </div>
+  </div>
+</div>
+
+<!-- 签发 Token 弹窗 -->
+<div class="modal-bg" id="issueModal">
+  <div class="modal">
+    <h3>签发新 Token</h3>
+    <label>issuer_id（必填，逻辑签发者标识）</label>
+    <input id="issueIssuer" type="text" placeholder="例如 admin 或 your-issuer" />
+    <label>subject_id（可选）</label>
+    <input id="issueSubject" type="text" placeholder="可选，主体标识" />
+    <label>name（可选，备注）</label>
+    <input id="issueName" type="text" placeholder="例如 测试token" />
+    <label>rate_limit_rpm（可选，每分钟请求数）</label>
+    <input id="issueRpm" type="text" placeholder="留空 = 不限" />
+    <label>token_budget（可选，额度）</label>
+    <input id="issueBudget" type="text" placeholder="留空 = 不限" />
+    <label>token_budget_period（预算周期）</label>
+    <select id="issuePeriod">
+      <option value="">不限</option>
+      <option value="daily">daily（每日）</option>
+      <option value="monthly">monthly（每月）</option>
+      <option value="total">total（累计）</option>
+    </select>
+    <div id="issueErr" class="err"></div>
+    <div id="issueResult" class="ok-msg"></div>
+    <div class="acts">
+      <button id="issueCancel">取消</button>
+      <button class="primary" id="issueSave">签发</button>
     </div>
   </div>
 </div>
@@ -281,6 +331,7 @@ document.querySelectorAll("nav.tabs button").forEach(b=>{
     $("tab-"+t).classList.add("active");
     if (t==="status") refreshStatus();
     if (t==="models") refreshModels();
+    if (t==="keys") refreshKeys();
     if (t==="chat") initChat();
   };
 });
@@ -598,6 +649,94 @@ async function sendChat(){
   }
 }
 $("chatStop").onclick = ()=>{ _chatStop = true; if (_reader) _reader.cancel(); };
+
+// ---------- 密钥与令牌 ----------
+async function refreshKeys(){
+  $("keysMsg").textContent = "加载中…";
+  $("keysErr").textContent = ""; $("issuerErr").textContent = "";
+  try {
+    const data = await api("/admin/pllm-tokens", {auth:"admin"});
+    renderTokenTable((data && data.items) || []);
+  } catch(e){ $("keysErr").textContent = "加载 Token 失败: " + e.message; }
+  try {
+    const d = await api("/admin/pllm-tokens/issuers", {auth:"admin"});
+    renderIssuerTable((d && d.items) || []);
+  } catch(e){ $("issuerErr").textContent = "加载签发者失败: " + e.message; }
+  $("keysMsg").textContent = "已刷新";
+}
+function renderTokenTable(items){
+  if(!items.length){ $("tokenTable").innerHTML = `<tr><td class="meta">暂无 Token</td></tr>`; return; }
+  let html = `<tr><th>Token ID</th><th>名称</th><th>Subject</th><th>Issuer</th><th>状态</th><th>RPM</th><th>预算</th><th>创建</th><th>吊销时间</th><th>操作</th></tr>`;
+  items.forEach(t=>{
+    const act = t.is_active ? '<span class="tag ok">启用</span>' : '<span class="tag bad">已吊销</span>';
+    const rev = t.revoked_at ? esc((t.revoked_at||"").replace("T"," ")) : "–";
+    html += `<tr>
+      <td class="wrap2">${esc(t.pllm_token_id)}</td>
+      <td>${esc(t.name||"–")}</td>
+      <td>${esc(t.subject_id||"–")}</td>
+      <td>${esc(t.issuer_id)}</td>
+      <td>${act}</td>
+      <td>${t.rate_limit_rpm!=null?t.rate_limit_rpm:"–"}</td>
+      <td>${t.token_budget!=null?t.token_budget:"–"}${t.token_budget_period?"/"+esc(t.token_budget_period):""}</td>
+      <td>${esc((t.created_at||"").replace("T"," "))}</td>
+      <td>${rev}</td>
+      <td>${t.is_active?`<button class="danger" data-revoke="${esc(t.pllm_token_id)}">吊销</button>`:""}</td>
+    </tr>`;
+  });
+  $("tokenTable").innerHTML = html;
+  $("tokenTable").querySelectorAll("button[data-revoke]").forEach(b=>{
+    b.onclick = ()=> revokeToken(b.dataset.revoke);
+  });
+}
+function renderIssuerTable(items){
+  if(!items.length){ $("issuerTable").innerHTML = `<tr><td class="meta">暂无签发者</td></tr>`; return; }
+  let html = `<tr><th>Issuer ID</th><th>Key ID</th><th>状态</th><th>公钥前缀</th><th>指纹(SHA256前16)</th><th>注册时间</th></tr>`;
+  items.forEach(r=>{
+    const act = r.is_active ? '<span class="tag ok">启用</span>' : '<span class="tag bad">停用</span>';
+    html += `<tr>
+      <td>${esc(r.issuer_id)}</td>
+      <td>${esc(r.key_id)}</td>
+      <td>${act}</td>
+      <td class="wrap2">${esc(r.public_key_prefix||"–")}</td>
+      <td class="wrap2">${esc(r.public_key_fingerprint||"–")}</td>
+      <td>${esc((r.created_at||"").replace("T"," "))}</td>
+    </tr>`;
+  });
+  $("issuerTable").innerHTML = html;
+}
+async function revokeToken(id){
+  if(!confirm("确认吊销 Token "+id+"？吊销后该 Token 立即失效，不可恢复。")) return;
+  $("keysMsg").textContent = "吊销中…";
+  try {
+    await api("/admin/pllm-tokens", {method:"DELETE", auth:"admin", body:{pllm_token_id:id}});
+    $("keysMsg").textContent = "已吊销 ✓";
+    await refreshKeys();
+  } catch(e){ $("keysErr").textContent = "吊销失败: " + e.message; }
+}
+$("keysRefresh").onclick = refreshKeys;
+$("keysIssueBtn").onclick = ()=> $("issueModal").classList.add("show");
+$("issueCancel").onclick = ()=> $("issueModal").classList.remove("show");
+$("issueSave").onclick = async ()=>{
+  $("issueErr").textContent = ""; $("issueResult").textContent = "";
+  const issuer = $("issueIssuer").value.trim();
+  if(!issuer){ $("issueErr").textContent = "issuer_id 必填"; return; }
+  const budget = $("issueBudget").value.trim();
+  const period = $("issuePeriod").value;
+  if(budget && !period){ $("issueErr").textContent = "填了预算必须选择周期(daily/monthly/total)"; return; }
+  const body = {
+    issuer_id: issuer,
+    subject_id: $("issueSubject").value.trim() || null,
+    name: $("issueName").value.trim() || null,
+    rate_limit_rpm: $("issueRpm").value.trim() ? Number($("issueRpm").value) : null,
+    token_budget: budget ? Number(budget) : null,
+    token_budget_period: period || null
+  };
+  try {
+    const r = await api("/admin/pllm-tokens", {method:"POST", auth:"admin", body});
+    $("issueResult").innerHTML = `已签发 ✓<br>Token（仅显示一次，请妥善保存）：<br><code>${esc(r.pllm_token)}</code><br>前缀：${esc(r.pllm_token_prefix)}`;
+    await refreshKeys();
+  } catch(e){ $("issueErr").textContent = "签发失败: " + e.message; }
+};
 
 // ---------- init ----------
 loadCfgInputs();

@@ -8,9 +8,18 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, status, Request
 from pydantic import BaseModel, Field
 
-from ..db import db, TokenRepo, AuditRepo
+from ..db import db, TokenRepo, AuditRepo, IssuerRepo
 
 router = APIRouter(prefix="/admin/pllm-tokens", tags=["Token Management"])
+
+
+def _is_local_admin(request: Request) -> bool:
+    """判断是否为本地管理台调用（x-local-admin 弱鉴权）。
+
+    该模式下绕过 Ed25519 签名的 issuer 隔离，供内网管理台查看/管理全部 token；
+    真实签名请求语义不受影响。
+    """
+    return request.headers.get("x-local-admin") == "true"
 
 
 class TokenIssueRequest(BaseModel):
@@ -42,10 +51,11 @@ async def issue_token(request: Request, body: TokenIssueRequest):
     
     每次调用都会生成新的 Token（非幂等），使用新的 nonce 防止重放。
     """
-    issuer_id = request.state.issuer_id
-    
-    # 验证 issuer_id 与签名头一致
-    if body.issuer_id != issuer_id:
+    is_admin = _is_local_admin(request)
+    issuer_id = request.state.issuer_id if not is_admin else body.issuer_id
+
+    # 验证 issuer_id 与签名头一致（本地管理模式直接用 body.issuer_id）
+    if not is_admin and body.issuer_id != issuer_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="issuer_id in body must match X-Issuer-Id header",
@@ -105,8 +115,9 @@ async def revoke_tokens(request: Request, body: TokenRevokeRequest):
     
     可以通过 pllm_token_id 吊销单个，或通过 issuer_id + subject_id 吊销所有。
     """
-    issuer_id = request.state.issuer_id
-    
+    is_admin = _is_local_admin(request)
+    issuer_id = request.state.issuer_id if not is_admin else None
+
     # 必须指定一种吊销方式
     if body.pllm_token_id and (body.issuer_id or body.subject_id):
         raise HTTPException(
@@ -130,8 +141,8 @@ async def revoke_tokens(request: Request, body: TokenRevokeRequest):
                     detail=f"Token not found: {body.pllm_token_id}",
                 )
             
-            # 验证权限：只能吊销自己签发的 Token
-            if token["issuer_id"] != issuer_id:
+            # 验证权限：只能吊销自己签发的 Token（本地管理模式可吊销任意）
+            if not is_admin and token["issuer_id"] != issuer_id:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Cannot revoke tokens issued by other issuers",
@@ -140,8 +151,8 @@ async def revoke_tokens(request: Request, body: TokenRevokeRequest):
             revoked = await TokenRepo.revoke_by_id(conn, body.pllm_token_id)
             action_detail = {"pllm_token_id": str(body.pllm_token_id)}
         else:
-            # 吊销指定 subject 的所有 Token
-            if body.issuer_id != issuer_id:
+            # 吊销指定 subject 的所有 Token（本地管理模式不受限）
+            if not is_admin and body.issuer_id != issuer_id:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Cannot revoke tokens for other issuers",
@@ -184,18 +195,17 @@ async def query_tokens(
     
     返回 Token 列表（包含已吊销的），但不返回明文。
     """
-    request_issuer_id = request.state.issuer_id
-    
-    # 只能查询自己签发的 Token
-    if issuer_id and issuer_id != request_issuer_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Cannot query tokens for other issuers",
-        )
-    
-    # 默认查询自己的 Token
-    if not issuer_id:
-        issuer_id = request_issuer_id
+    request_issuer_id = request.state.issuer_id if not _is_local_admin(request) else None
+
+    # 非本地管理模式：只能查询自己签发的 Token
+    if not _is_local_admin(request):
+        if issuer_id and issuer_id != request_issuer_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Cannot query tokens for other issuers",
+            )
+        if not issuer_id:
+            issuer_id = request_issuer_id
     
     if page_size > 100:
         page_size = 100
@@ -241,8 +251,9 @@ async def update_token_budget(
     body: TokenBudgetUpdateRequest,
 ):
     """更新 Token 预算"""
-    issuer_id = request.state.issuer_id
-    
+    is_admin = _is_local_admin(request)
+    issuer_id = request.state.issuer_id if not is_admin else None
+
     # 至少需要指定一个字段
     if body.token_budget is None and body.token_budget_period is None:
         raise HTTPException(
@@ -266,7 +277,7 @@ async def update_token_budget(
                 detail=f"Token not found: {pllm_token_id}",
             )
         
-        if token["issuer_id"] != issuer_id:
+        if not is_admin and token["issuer_id"] != issuer_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Cannot update tokens issued by other issuers",
@@ -306,3 +317,26 @@ async def update_token_budget(
         "token_budget_period": updated["token_budget_period"],
         "updated_at": updated["created_at"].isoformat(),
     }
+
+
+@router.get("/issuers")
+async def list_issuers(request: Request):
+    """查询已注册签发者（公钥指纹）。
+
+    仅暴露公钥前缀与 SHA256 指纹用于核对，不返回完整公钥明文。
+    x-local-admin 放行，供内网管理台查看已注册的 Ed25519 签发者。
+    """
+    async with db.pool.acquire() as conn:
+        rows = await IssuerRepo.list_all(conn)
+    items = []
+    for r in rows:
+        pk = r.get("public_key") or ""
+        items.append({
+            "issuer_id": r["issuer_id"],
+            "key_id": r["key_id"],
+            "is_active": r["is_active"],
+            "public_key_prefix": (pk[:16] + "…") if pk else None,
+            "public_key_fingerprint": hashlib.sha256(pk.encode()).hexdigest()[:16] if pk else None,
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        })
+    return {"items": items, "total": len(items)}
