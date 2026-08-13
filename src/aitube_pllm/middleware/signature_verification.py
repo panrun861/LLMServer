@@ -22,6 +22,12 @@ class SignatureVerificationMiddleware(BaseHTTPMiddleware):
         if not request.url.path.startswith("/admin/"):
             return await call_next(request)
 
+        # 放行浏览器 CORS 预检（OPTIONS）。预检请求不含业务签名头，
+        # 若在此拦截会导致所有跨域带自定义 header 的请求预检失败（curl 测试无此问题，
+        # 故只在浏览器端暴露）。真实请求仍走完整签名校验，安全不受影响。
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         # 仪表盘只读接口使用专用 token 认证，跳过 Ed25519 签名
         if request.url.path.startswith("/admin/dashboard"):
             return await call_next(request)

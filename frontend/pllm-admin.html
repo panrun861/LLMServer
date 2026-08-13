@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PLLM 管理控制台</title>
+<style>
+  :root { --bg:#0f1420; --card:#1a2233; --txt:#e6ecf5; --muted:#8b97ad; --line:#27324a;
+          --ok:#3ecf8e; --warn:#f2c14e; --bad:#ff6b6b; --accent:#5b8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:16px 22px; display:flex; align-items:center; justify-content:space-between;
+           border-bottom:1px solid var(--line); flex-wrap:wrap; gap:10px; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:12px; margin-top:3px; }
+  button { cursor:pointer; border:1px solid var(--line); background:var(--card); color:var(--txt);
+           padding:7px 14px; border-radius:8px; font-size:13px; transition:.15s; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--bad); border-color:var(--bad); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  nav.tabs { display:flex; gap:6px; padding:12px 22px 0; flex-wrap:wrap; }
+  nav.tabs button { background:transparent; border-color:transparent; color:var(--muted); }
+  nav.tabs button.active { background:var(--card); color:var(--txt); border-color:var(--line); }
+  main { padding:18px 22px 60px; }
+  section { display:none; } section.active { display:block; }
+  .wrap { max-width:1180px; margin:0 auto; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .panel h2 { font-size:14px; margin:0 0 12px; color:var(--muted); font-weight:600; }
+  .row { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+  .kpi { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .kpi .label { color:var(--muted); font-size:12px; }
+  .kpi .value { font-size:22px; font-weight:700; margin-top:6px; }
+  .grid2 { display:grid; gap:14px; grid-template-columns:1fr 1fr; }
+  @media (max-width:900px){ .grid2 { grid-template-columns:1fr; } }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; position:sticky; top:0; background:var(--card); }
+  td.wrap2 { white-space:normal; word-break:break-all; }
+  .tag { padding:2px 8px; border-radius:999px; font-size:12px; }
+  .tag.ok { background:rgba(62,207,142,.15); color:var(--ok); }
+  .tag.warn { background:rgba(242,193,78,.15); color:var(--warn); }
+  .tag.bad { background:rgba(255,107,107,.15); color:var(--bad); }
+  .tag.muted { background:rgba(139,151,173,.15); color:var(--muted); }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+  .on { background:var(--ok); } .off { background:var(--bad); }
+  .err { color:var(--bad); padding:8px 0; font-size:13px; }
+  .ok-msg { color:var(--ok); padding:8px 0; font-size:13px; }
+  .meta { color:var(--muted); font-size:12px; }
+  .scroll { max-height:360px; overflow:auto; }
+  /* config */
+  #config { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  #config.collapsed .cfg-body { display:none; }
+  .cfg-body { display:grid; gap:12px; grid-template-columns:1fr 1fr; margin-top:10px; }
+  @media (max-width:760px){ .cfg-body { grid-template-columns:1fr; } }
+  .field { display:flex; flex-direction:column; gap:5px; }
+  .field label { font-size:12px; color:var(--muted); }
+  .field input { background:#0c111c; border:1px solid var(--line); color:var(--txt);
+                 padding:8px 10px; border-radius:8px; font-size:13px; }
+  .cfg-actions { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  /* model cards */
+  .cards { display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); }
+  .mcard { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .mcard h3 { margin:0 0 8px; font-size:15px; }
+  .mcard .meta { line-height:1.7; }
+  .mcard .acts { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  .badges { display:flex; gap:6px; flex-wrap:wrap; margin:8px 0; }
+  /* chat */
+  .chat-box { background:#0c111c; border:1px solid var(--line); border-radius:12px; height:56vh; overflow:auto; padding:16px; }
+  .msg { margin-bottom:14px; max-width:82%; padding:10px 14px; border-radius:12px; font-size:14px; line-height:1.6; white-space:pre-wrap; word-break:break-word; }
+  .msg.user { background:var(--accent); color:#fff; margin-left:auto; border-bottom-right-radius:4px; }
+  .msg.assistant { background:var(--card); border:1px solid var(--line); margin-right:auto; border-bottom-left-radius:4px; }
+  .chat-input { display:flex; gap:10px; margin-top:12px; }
+  .chat-input textarea { flex:1; background:#0c111c; border:1px solid var(--line); color:var(--txt);
+                         padding:11px 13px; border-radius:10px; font-size:14px; resize:vertical; min-height:46px; font-family:inherit; }
+  .current-model { font-size:12px; color:var(--muted); margin-bottom:8px; }
+  /* modal */
+  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:50; }
+  .modal-bg.show { display:flex; }
+  .modal { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; width:min(560px,92vw); max-height:86vh; overflow:auto; }
+  .modal h3 { margin:0 0 14px; font-size:16px; }
+  .modal label { font-size:12px; color:var(--muted); display:block; margin:12px 0 5px; }
+  .modal input[type=text], .modal textarea { width:100%; background:#0c111c; border:1px solid var(--line); color:var(--txt);
+       padding:9px 11px; border-radius:8px; font-size:13px; font-family:inherit; }
+  .modal textarea { min-height:90px; resize:vertical; }
+  .modal .acts { display:flex; gap:8px; justify-content:flex-end; margin-top:18px; }
+  .hint { font-size:11px; color:var(--muted); margin-top:4px; }
+  code { background:#0c111c; padding:1px 6px; border-radius:5px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>PLLM 管理控制台</h1>
+    <div class="sub">状态查看 · 模型切换 · 参数更新 · 对话测试</div>
+  </div>
+  <button id="cfgToggle">⚙ 连接配置</button>
+</header>
+
+<div class="wrap">
+  <div id="config" class="collapsed">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <strong>连接配置</strong>
+      <span class="meta">配置保存在本机浏览器 localStorage，不上传</span>
+    </div>
+    <div class="cfg-body">
+      <div class="field">
+        <label>API Base URL</label>
+        <input id="cfgBase" type="text" placeholder="http://35.76.187.215:8080" />
+      </div>
+      <div class="field">
+        <label>PLLM Token（对话 / 列模型，Bearer）</label>
+        <input id="cfgToken" type="password" placeholder="pllm_xxx 或任意已登记 token" />
+      </div>
+      <div class="field">
+        <label>Dashboard Token（系统资源，可选）</label>
+        <input id="cfgDToken" type="password" placeholder="填了才能看 GPU/资源" />
+      </div>
+      <div class="field">
+        <label>模型管理鉴权</label>
+        <input type="text" value="x-local-admin: true（已内置）" disabled />
+      </div>
+    </div>
+    <div class="cfg-actions">
+      <button class="primary" id="cfgSave">保存配置</button>
+      <button id="cfgTest">测试连接 (/health)</button>
+      <span id="cfgStatus" class="meta"></span>
+    </div>
+    <div class="hint">说明：模型管理接口 (/admin/models) 由请求头 <code>x-local-admin:true</code> 放行；对话与模型列表 (/v1/*) 用 PLLM Token；系统资源 (/admin/dashboard/snapshot) 用 Dashboard Token。</div>
+  </div>
+
+  <nav class="tabs">
+    <button data-tab="status" class="active">状态总览</button>
+    <button data-tab="models">模型管理</button>
+    <button data-tab="chat">对话测试</button>
+  </nav>
+
+  <main>
+    <!-- ============ 状态 ============ -->
+    <section id="tab-status" class="active">
+      <div class="panel">
+        <h2>连接与接口状态</h2>
+        <div class="cfg-actions">
+          <button class="primary" id="statusRefresh">刷新状态</button>
+          <span id="statusMsg" class="meta"></span>
+        </div>
+        <div id="healthKpis" class="row" style="margin-top:12px;"></div>
+      </div>
+
+      <div class="panel">
+        <h2>模型登记状态（/admin/models）</h2>
+        <div id="modelStatusErr" class="err"></div>
+        <div class="scroll"><table id="modelStatusTable"></table></div>
+      </div>
+
+      <div id="sysBlock">
+        <div class="panel">
+          <h2>系统资源（需 Dashboard Token）</h2>
+          <div id="sysMsg" class="meta">未填写 Dashboard Token，已隐藏系统级监控。</div>
+          <div id="sysKpis" class="row" style="margin-top:12px;"></div>
+        </div>
+        <div class="grid2">
+          <div class="panel"><h2>GPU</h2><div class="scroll"><table id="gpuTable"></table></div></div>
+          <div class="panel"><h2>依赖健康 &amp; 推理并发</h2>
+            <div id="healthBlock" class="meta"></div>
+            <div id="inferenceBlock" class="meta" style="margin-top:10px;"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 模型管理 ============ -->
+    <section id="tab-models">
+      <div class="panel">
+        <h2>模型管理</h2>
+        <div class="cfg-actions">
+          <button class="primary" id="modelsRefresh">刷新</button>
+          <button id="modelsSync">同步模型 (POST /sync)</button>
+          <span id="modelsMsg" class="meta"></span>
+        </div>
+        <div id="modelsErr" class="err"></div>
+        <div id="modelCards" class="cards" style="margin-top:14px;"></div>
+      </div>
+    </section>
+
+    <!-- ============ 对话 ============ -->
+    <section id="tab-chat">
+      <div class="panel">
+        <h2>对话测试</h2>
+        <div class="current-model" id="chatModel">当前模型：加载中…</div>
+        <div class="chat-box" id="chatBox"></div>
+        <div class="chat-input">
+          <textarea id="chatText" placeholder="输入消息，回车发送（Shift+Enter 换行）"></textarea>
+          <button class="primary" id="chatSend">发送</button>
+          <button id="chatStop" style="display:none;">停止</button>
+        </div>
+        <div id="chatMsg" class="meta" style="margin-top:8px;"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 编辑参数 modal -->
+<div class="modal-bg" id="editModal">
+  <div class="modal">
+    <h3 id="editTitle">编辑模型参数</h3>
+    <label>API Base（后端地址，external_api 必填）</label>
+    <input id="editApiBase" type="text" placeholder="https://... 或 http://host:8000/v1" />
+    <label>启用 (is_enabled)</label>
+    <input id="editEnabled" type="text" placeholder="true / false" />
+    <label>runtime_params（JSON 对象，运行时参数）</label>
+    <textarea id="editRuntime" placeholder='{"temperature":0.7,"max_tokens":1024}'></textarea>
+    <div class="hint">例如默认采样参数、透传给 vLLM/LiteLLM 的扩展字段。</div>
+    <label>request_params（JSON 对象，请求级参数）</label>
+    <textarea id="editRequest" placeholder='{}'></textarea>
+    <div id="editErr" class="err"></div>
+    <div class="acts">
+      <button id="editCancel">取消</button>
+      <button class="primary" id="editSave">保存 (PATCH)</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const LS = { base:"pllm_base", token:"pllm_token", dtoken:"pllm_dtoken" };
+function cfg(){
+  return {
+    base: (localStorage.getItem(LS.base) || "http://35.76.187.215:8080").replace(/\/+$/,""),
+    token: localStorage.getItem(LS.token) || "",
+    dtoken: localStorage.getItem(LS.dtoken) || ""
+  };
+}
+function loadCfgInputs(){
+  document.getElementById("cfgBase").value = localStorage.getItem(LS.base) || "http://35.76.187.215:8080";
+  document.getElementById("cfgToken").value = localStorage.getItem(LS.token) || "";
+  document.getElementById("cfgDToken").value = localStorage.getItem(LS.dtoken) || "";
+}
+function saveCfg(){
+  localStorage.setItem(LS.base, document.getElementById("cfgBase").value.trim());
+  localStorage.setItem(LS.token, document.getElementById("cfgToken").value.trim());
+  localStorage.setItem(LS.dtoken, document.getElementById("cfgDToken").value.trim());
+}
+
+async function api(path, opts={}){
+  const c = cfg();
+  const method = opts.method || "GET";
+  const headers = { "Content-Type":"application/json" };
+  if (opts.auth === "admin") headers["x-local-admin"] = "true";
+  else if (opts.auth === "bearer") headers["Authorization"] = "Bearer " + c.token;
+  else if (opts.auth === "dash") headers["X-Dashboard-Token"] = c.dtoken;
+  const res = await fetch(c.base + path, {
+    method,
+    headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  });
+  if (!res.ok){
+    let msg = "HTTP " + res.status;
+    try { const j = await res.json(); if (j && j.detail) msg = (Array.isArray(j.detail)? j.detail.map(x=>x.msg||x).join("; ") : j.detail); } catch(e){}
+    throw new Error(msg);
+  }
+  if (res.status === 204) return null;
+  const ct = res.headers.get("content-type") || "";
+  if (ct.includes("application/json")) return res.json();
+  return res.text();
+}
+
+const $ = (id) => document.getElementById(id);
+function fmt(n){ return (n==null?0:n).toLocaleString(); }
+function fmtBytes(n){ if(n==null) return "–"; n=Number(n); const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+" "+u[i]; }
+function esc(s){ return String(s==null?"":s).replace(/[&<>]/g, m=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[m])); }
+
+// ---------- tabs ----------
+document.querySelectorAll("nav.tabs button").forEach(b=>{
+  b.onclick = ()=>{
+    document.querySelectorAll("nav.tabs button").forEach(x=>x.classList.remove("active"));
+    document.querySelectorAll("main section").forEach(x=>x.classList.remove("active"));
+    b.classList.add("active");
+    const t = b.dataset.tab;
+    $("tab-"+t).classList.add("active");
+    if (t==="status") refreshStatus();
+    if (t==="models") refreshModels();
+    if (t==="chat") initChat();
+  };
+});
+$("cfgToggle").onclick = ()=> $("config").classList.toggle("collapsed");
+$("cfgSave").onclick = ()=>{ saveCfg(); $("cfgStatus").textContent = "已保存 ✓"; setTimeout(()=>$("cfgStatus").textContent="",2000); };
+$("cfgTest").onclick = async ()=>{
+  $("cfgStatus").textContent = "测试中…";
+  try { const r = await api("/health"); $("cfgStatus").textContent = "连接成功: " + (r&&r.status||"ok") + " ✓"; }
+  catch(e){ $("cfgStatus").textContent = "连接失败: " + e.message; }
+};
+
+// ---------- 状态 ----------
+async function refreshStatus(){
+  $("statusMsg").textContent = "加载中…";
+  $("modelStatusErr").textContent = "";
+  // health
+  try {
+    const h = await api("/health");
+    $("healthKpis").innerHTML = `<div class="kpi"><div class="label">API 服务</div><div class="value" style="color:var(--ok)">${esc(h.status||"healthy")}</div></div>`;
+  } catch(e){
+    $("healthKpis").innerHTML = `<div class="kpi"><div class="label">API 服务</div><div class="value" style="color:var(--bad)">不可达</div></div>`;
+    $("statusMsg").textContent = "API 不可达: " + e.message;
+  }
+  // models
+  try {
+    const data = await api("/admin/models", {auth:"admin"});
+    const items = (data && data.items) || [];
+    renderModelStatus(items);
+  } catch(e){ $("modelStatusErr").textContent = "加载模型失败: " + e.message; }
+  // dashboard snapshot
+  await loadSnapshot();
+  $("statusMsg").textContent = "已刷新";
+}
+
+function renderModelStatus(items){
+  if (!items.length){ $("modelStatusTable").innerHTML = `<tr><td class="meta">暂无模型</td></tr>`; return; }
+  let html = `<tr><th>模型</th><th>档位</th><th>类型</th><th>当前</th><th>启用</th><th>同步</th><th>上下文</th><th>API Base</th><th>Key</th></tr>`;
+  items.forEach(m=>{
+    const cur = m.is_current ? '<span class="tag ok">当前</span>' : '<span class="tag muted">—</span>';
+    const en = m.is_enabled ? '<span class="tag ok">✓</span>' : '<span class="tag bad">✗</span>';
+    const sync = m.sync_status==="synced" ? '<span class="tag ok">synced</span>'
+               : m.sync_status==="failed" ? '<span class="tag bad">failed</span>'
+               : '<span class="tag warn">'+esc(m.sync_status||"pending")+'</span>';
+    html += `<tr>
+      <td>${esc(m.model_name)}</td><td>${esc(m.tier)}</td><td>${esc(m.upstream_type||"–")}</td>
+      <td>${cur}</td><td>${en}</td><td>${sync}</td>
+      <td>${fmt(m.context_length)}</td>
+      <td class="wrap2">${esc(m.api_base||"–")}</td>
+      <td>${esc(m.api_key_masked||"–")}</td></tr>`;
+  });
+  $("modelStatusTable").innerHTML = html;
+}
+
+async function loadSnapshot(){
+  const c = cfg();
+  if (!c.dtoken){
+    $("sysBlock").style.display = "none";
+    return;
+  }
+  $("sysBlock").style.display = "block";
+  $("sysMsg").textContent = "加载中…";
+  try {
+    const d = await api("/admin/dashboard/snapshot?window=24", {auth:"dash"});
+    renderSnapshot(d);
+    $("sysMsg").textContent = "";
+  } catch(e){
+    $("sysMsg").textContent = "快照加载失败: " + e.message;
+  }
+}
+
+function renderSnapshot(d){
+  const sys = (d && d.system) || {};
+  if (sys.available){
+    const h = sys.host || {};
+    const memPct = h.mem_total_bytes ? (h.mem_used_bytes/h.mem_total_bytes*100).toFixed(1) : "–";
+    const diskPct = h.disk_total_bytes ? (h.disk_used_bytes/h.disk_total_bytes*100).toFixed(1) : "–";
+    $("sysKpis").innerHTML = `
+      <div class="kpi"><div class="label">CPU 使用率</div><div class="value">${h.cpu_percent!=null?h.cpu_percent:"–"}%</div></div>
+      <div class="kpi"><div class="label">内存</div><div class="value">${memPct}%</div><div class="meta">${fmt(h.mem_used_bytes)}/${fmt(h.mem_total_bytes)}</div></div>
+      <div class="kpi"><div class="label">磁盘</div><div class="value">${diskPct}%</div><div class="meta">${fmt(h.disk_used_bytes)}/${fmt(h.disk_total_bytes)}</div></div>
+      <div class="kpi"><div class="label">负载(1m)</div><div class="value">${h.load_1m!=null?h.load_1m:"–"}</div></div>
+      <div class="kpi"><div class="label">运行时长</div><div class="value" style="font-size:16px">${h.uptime_seconds!=null?fmtUptime(h.uptime_seconds):"–"}</div></div>
+      <div class="kpi"><div class="label">进程数</div><div class="value">${h.process_count!=null?h.process_count:"–"}</div></div>`;
+    const gpu = sys.gpu || {};
+    if (gpu.available){
+      let g = `<tr><th>GPU</th><th>型号</th><th>利用率</th><th>显存</th><th>温度</th></tr>`;
+      (gpu.gpus||[]).forEach(x=>{
+        g += `<tr><td>${x.index}</td><td>${esc(x.name)}</td><td>${x.utilization_percent}%</td>
+          <td>${fmt(Math.round(x.memory_used_mb*1048576))}/${fmt(Math.round(x.memory_total_mb*1048576))}</td><td>${x.temperature_c}°C</td></tr>`;
+      });
+      $("gpuTable").innerHTML = g;
+    } else { $("gpuTable").innerHTML = `<tr><td class="meta">GPU 不可用${gpu.error?"："+esc(gpu.error):""}</td></tr>`; }
+  } else {
+    $("sysKpis").innerHTML = `<div class="kpi"><div class="label">系统资源</div><div class="value" style="color:var(--bad);font-size:14px">采集失败</div></div>`;
+    $("gpuTable").innerHTML = "";
+  }
+  // health & inference
+  const h = (d && d.health) || {};
+  $("healthBlock").innerHTML =
+    `<div><span class="dot ${h.db_ok?"on":"off"}"></span>数据库 ${h.db_ok?"正常":"异常"}</div>
+     <div><span class="dot ${h.litellm_reachable?"on":"off"}"></span>LiteLLM ${h.litellm_reachable?"可达":"不可达"}</div>`;
+  const inf = (d && d.inference) || {};
+  if (inf.available){
+    $("inferenceBlock").innerHTML =
+      `<div>引擎：<b>${esc(inf.engine||"–")}</b></div>
+       <div>运行中：<b style="color:var(--ok)">${fmt(inf.running_requests)}</b> · 排队中：<b style="color:var(--warn)">${fmt(inf.queued_requests)}</b> · 在途合计：<b>${fmt(inf.total_inflight)}</b></div>`;
+  } else {
+    $("inferenceBlock").innerHTML = `<div class="meta">推理并发监控不可用${inf.error?"："+esc(inf.error):""}</div>`;
+  }
+}
+function fmtUptime(s){ if(s==null) return "–"; s=Math.floor(s); const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60); return (d>0?d+"天 ":"")+h+"时"+m+"分"; }
+
+// ---------- 模型管理 ----------
+let _modelsCache = [];
+async function refreshModels(){
+  $("modelsMsg").textContent = "加载中…";
+  $("modelsErr").textContent = "";
+  try {
+    const data = await api("/admin/models", {auth:"admin"});
+    _modelsCache = (data && data.items) || [];
+    renderModelCards(_modelsCache);
+    $("modelsMsg").textContent = "共 " + _modelsCache.length + " 条";
+  } catch(e){ $("modelsErr").textContent = "加载失败: " + e.message; }
+}
+
+function renderModelCards(items){
+  if (!items.length){ $("modelCards").innerHTML = `<div class="meta">暂无模型</div>`; return; }
+  let html = "";
+  items.forEach(m=>{
+    const cur = m.is_current ? '<span class="tag ok">当前</span>' : '<span class="tag muted">—</span>';
+    const en = m.is_enabled ? '<span class="tag ok">启用</span>' : '<span class="tag bad">禁用</span>';
+    const sync = m.sync_status==="synced" ? '<span class="tag ok">synced</span>'
+               : m.sync_status==="failed" ? '<span class="tag bad">failed</span>'
+               : '<span class="tag warn">'+esc(m.sync_status||"pending")+'</span>';
+    html += `<div class="mcard">
+      <h3>${esc(m.model_name)} <span class="meta">:${esc(m.tier)}</span></h3>
+      <div class="badges">${cur}${en}${sync}<span class="tag muted">${esc(m.upstream_type||"–")}</span></div>
+      <div class="meta">
+        上下文：${fmt(m.context_length)}<br>
+        API Base：${esc(m.api_base||"–")}<br>
+        Key：${esc(m.api_key_masked||"–")}<br>
+        更新：${esc((m.updated_at||"").replace("T"," "))}
+      </div>
+      <div class="acts">
+        <button class="primary" data-act="current" data-name="${esc(m.model_name)}" data-tier="${esc(m.tier)}">设为全局当前</button>
+        <button data-act="edit" data-name="${esc(m.model_name)}" data-tier="${esc(m.tier)}">编辑参数</button>
+      </div>
+    </div>`;
+  });
+  $("modelCards").innerHTML = html;
+  $("modelCards").querySelectorAll("button").forEach(b=>{
+    b.onclick = ()=>{
+      if (b.dataset.act==="current") setCurrent(b.dataset.name, b.dataset.tier);
+      else if (b.dataset.act==="edit") openEdit(b.dataset.name, b.dataset.tier);
+    };
+  });
+}
+
+async function setCurrent(name, tier){
+  if (!confirm(`确认把 ${name}:${tier} 设为全局当前模型？\n网关将把后续请求路由到该模型。`)) return;
+  $("modelsMsg").textContent = "切换中…";
+  try {
+    await api(`/admin/models/${encodeURIComponent(name)}/active-tier`, {method:"PUT", auth:"admin", body:{tier}});
+    $("modelsMsg").textContent = "已设为当前 ✓";
+    await refreshModels();
+  } catch(e){ $("modelsErr").textContent = "切换失败: " + e.message; }
+}
+
+$("modelsSync").onclick = async ()=>{
+  if (!confirm("执行 POST /admin/models/sync？将从上游同步模型可用状态与上下文长度。")) return;
+  $("modelsMsg").textContent = "同步中…";
+  try {
+    const r = await api("/admin/models/sync", {method:"POST", auth:"admin"});
+    $("modelsMsg").textContent = `同步完成：synced=${r.synced}, failed=${r.failed}, created=${r.created} ✓`;
+    await refreshModels();
+  } catch(e){ $("modelsErr").textContent = "同步失败: " + e.message; }
+};
+
+// edit modal
+let _editTarget = null;
+function openEdit(name, tier){
+  _editTarget = {name, tier};
+  const m = _modelsCache.find(x=>x.model_name===name && x.tier===tier) || {};
+  $("editTitle").textContent = `编辑参数：${name}:${tier}`;
+  $("editApiBase").value = m.api_base || "";
+  $("editEnabled").value = m.is_enabled===false ? "false" : "true";
+  $("editRuntime").value = m.runtime_params && typeof m.runtime_params==="object" ? JSON.stringify(m.runtime_params,null,2) : (typeof m.runtime_params==="string"?m.runtime_params:"{}");
+  $("editRequest").value = m.request_params ? JSON.stringify(m.request_params,null,2) : "{}";
+  $("editErr").textContent = "";
+  $("editModal").classList.add("show");
+}
+$("editCancel").onclick = ()=> $("editModal").classList.remove("show");
+$("editSave").onclick = async ()=>{
+  if (!_editTarget) return;
+  $("editErr").textContent = "";
+  let runtime=null, request=null;
+  try { runtime = $("editRuntime").value.trim() ? JSON.parse($("editRuntime").value) : null; }
+  catch(e){ $("editErr").textContent = "runtime_params 不是合法 JSON"; return; }
+  try { request = $("editRequest").value.trim() ? JSON.parse($("editRequest").value) : null; }
+  catch(e){ $("editErr").textContent = "request_params 不是合法 JSON"; return; }
+  const enabledRaw = $("editEnabled").value.trim().toLowerCase();
+  const isEnabled = enabledRaw==="false" ? false : true;
+  const body = {
+    api_base: $("editApiBase").value.trim() || null,
+    is_enabled: isEnabled,
+    runtime_params: runtime,
+    request_params: request
+  };
+  try {
+    await api(`/admin/models/${encodeURIComponent(_editTarget.name)}/tiers/${encodeURIComponent(_editTarget.tier)}`,
+      {method:"PATCH", auth:"admin", body});
+    $("editModal").classList.remove("show");
+    $("modelsMsg").textContent = "参数已更新 ✓";
+    await refreshModels();
+  } catch(e){ $("editErr").textContent = "保存失败: " + e.message; }
+};
+
+// ---------- 对话 ----------
+let _chatModel = null;
+let _chatStop = false;
+let _reader = null;
+async function initChat(){
+  $("chatMsg").textContent = "获取当前模型…";
+  try {
+    // 优先取全局 current（is_current 且 updated_at 最新）
+    const data = await api("/admin/models", {auth:"admin"});
+    const items = (data && data.items) || [];
+    const currents = items.filter(m=>m.is_current).sort((a,b)=> new Date(b.updated_at)-new Date(a.updated_at));
+    if (currents.length){ _chatModel = currents[0].model_name; }
+    else {
+      const vm = await api("/v1/models", {auth:"bearer"});
+      const list = (vm && vm.data) || [];
+      _chatModel = list.length ? list[0].id : null;
+    }
+    $("chatModel").textContent = "当前模型：" + (_chatModel || "（无可用模型）");
+    $("chatMsg").textContent = "";
+  } catch(e){ $("chatMsg").textContent = "获取模型失败: " + e.message; }
+}
+
+function appendMsg(role, text){
+  const box = $("chatBox");
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  div.textContent = text;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  return div;
+}
+
+$("chatSend").onclick = sendChat;
+$("chatText").addEventListener("keydown", e=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendChat(); } });
+
+async function sendChat(){
+  const text = $("chatText").value.trim();
+  if (!text) return;
+  if (!_chatModel){ $("chatMsg").textContent = "没有可用模型，无法对话"; return; }
+  const c = cfg();
+  if (!c.token){ $("chatMsg").textContent = "请先在连接配置填写 PLLM Token"; return; }
+
+  $("chatText").value = "";
+  appendMsg("user", text);
+  const assistantDiv = appendMsg("assistant", "…");
+
+  // 收集历史
+  const history = [];
+  document.querySelectorAll("#chatBox .msg").forEach(el=>{
+    const role = el.classList.contains("user") ? "user" : (el.classList.contains("assistant") ? "assistant" : null);
+    if (role && el !== assistantDiv) history.push({role, content: el.textContent});
+  });
+
+  _chatStop = false;
+  $("chatSend").disabled = true;
+  $("chatStop").style.display = "inline-block";
+  $("chatMsg").textContent = "生成中…";
+
+  try {
+    const res = await fetch(c.base + "/v1/chat/completions", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+c.token },
+      body: JSON.stringify({ model:_chatModel, messages:history.concat([{role:"user",content:text}]), stream:true, temperature:0.7, max_tokens:1024 })
+    });
+    if (!res.ok){ let msg="HTTP "+res.status; try{msg=(await res.json()).detail||msg}catch(e){} throw new Error(msg); }
+    _reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "", full = "";
+    while(true){
+      if (_chatStop) break;
+      const {done, value} = await _reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream:true});
+      let idx;
+      while((idx = buf.indexOf("\n\n")) >= 0){
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx+2);
+        const line = chunk.split("\n").find(l=>l.startsWith("data:"));
+        if (!line) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]"){ break; }
+        try {
+          const j = JSON.parse(payload);
+          const delta = (j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content) || "";
+          if (delta){ full += delta; assistantDiv.textContent = full; $("chatBox").scrollTop = $("chatBox").scrollHeight; }
+        } catch(e){}
+      }
+    }
+    if (_chatStop){ assistantDiv.textContent = full + " ⏹(已停止)"; }
+    else if (!full){ assistantDiv.textContent = "（无内容返回）"; }
+    $("chatMsg").textContent = "完成";
+  } catch(e){
+    assistantDiv.textContent = "⚠ 错误：" + e.message;
+    $("chatMsg").textContent = "对话失败";
+  } finally {
+    $("chatSend").disabled = false;
+    $("chatStop").style.display = "none";
+    _reader = null;
+  }
+}
+$("chatStop").onclick = ()=>{ _chatStop = true; if (_reader) _reader.cancel(); };
+
+// ---------- init ----------
+loadCfgInputs();
+refreshStatus();
+</script>
+</body>
+</html>
