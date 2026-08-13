@@ -319,7 +319,7 @@ class ModelRepo:
         params: list[Any] = [model_name, tier]
         idx = 3
         for key in (
-            "api_base", "api_key_encrypted", "runtime_params", "request_params",
+            "api_base", "api_key_encrypted", "model_artifact", "runtime_params", "request_params",
             "is_enabled", "sync_status", "context_length", "last_synced_at",
         ):
             if key in kwargs:

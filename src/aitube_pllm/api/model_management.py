@@ -103,6 +103,8 @@ class ModelRegisterRequest(BaseModel):
 class ModelUpdateRequest(BaseModel):
     api_base: Optional[str] = Field(None, max_length=500)
     api_key: Optional[str] = Field(None, max_length=1024)
+    model_artifact: Optional[str] = Field(None, max_length=255)
+    context_length: Optional[int] = Field(None, gt=0)
     runtime_params: Optional[dict] = None
     request_params: Optional[dict] = None
     is_enabled: Optional[bool] = None

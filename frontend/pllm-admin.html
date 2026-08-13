@@ -262,6 +262,10 @@
 <div class="modal-bg" id="editModal">
   <div class="modal">
     <h3 id="editTitle">编辑模型参数</h3>
+    <label>model_artifact（模型标识，留空 = 不修改）</label>
+    <input id="editArtifact" type="text" placeholder="如 Qwen/Qwen3-8B" />
+    <label>context_length（上下文长度，留空 = 不修改）</label>
+    <input id="editContext" type="text" placeholder="如 128000" />
     <label>API Base（后端地址，external_api 必填）</label>
     <input id="editApiBase" type="text" placeholder="https://... 或 http://host:8000/v1" />
     <label>API Key（后端密钥，external_api 必填；留空 = 不修改）</label>
@@ -331,8 +335,13 @@
     <input id="regApiBase" type="text" placeholder="https://api.siliconflow.cn/v1" />
     <label>api_key（external_api 必填，AES 加密入库）</label>
     <input id="regApiKey" type="password" placeholder="sk-..." />
-    <label>tier（档位，默认 medium）</label>
-    <input id="regTier" type="text" placeholder="medium" />
+    <label>tier（档位）</label>
+    <select id="regTier">
+      <option value="medium">medium（中档）</option>
+      <option value="premium">premium（高档）</option>
+      <option value="low">low（低档）</option>
+      <option value="high">high</option>
+    </select>
     <label>runtime_params（JSON，可选）</label>
     <textarea id="regRuntime" placeholder='{}'></textarea>
     <label>request_params（JSON，可选）</label>
@@ -702,6 +711,8 @@ function openEdit(name, tier){
   _editTarget = {name, tier};
   const m = _modelsCache.find(x=>x.model_name===name && x.tier===tier) || {};
   $("editTitle").textContent = `编辑参数：${name}:${tier}`;
+  $("editArtifact").value = m.model_artifact || "";
+  $("editContext").value = m.context_length != null ? m.context_length : "";
   $("editApiBase").value = m.api_base || "";
   $("editApiKey").value = "";
   const keyHint = $("editApiKeyHint");
@@ -732,6 +743,10 @@ $("editSave").onclick = async ()=>{
   };
   const apiKey = $("editApiKey").value.trim();
   if (apiKey) body.api_key = apiKey;
+  const artifact = $("editArtifact").value.trim();
+  if (artifact) body.model_artifact = artifact;
+  const ctx = $("editContext").value.trim();
+  if (ctx && Number(ctx)) body.context_length = Number(ctx);
   try {
     await api(`/admin/models/${encodeURIComponent(_editTarget.name)}/tiers/${encodeURIComponent(_editTarget.tier)}`,
       {method:"PATCH", auth:"admin", body});
