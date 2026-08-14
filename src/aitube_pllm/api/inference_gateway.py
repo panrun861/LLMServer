@@ -217,7 +217,7 @@ async def _record_usage(
             await UsageRepo.record(
                 conn,
                 request_id=request_id,
-                pllm_token_ref_id=token_record["pllm_token_id"],
+                pllm_token_ref_id=token_record["id"],
                 pllm_token_id_snapshot=token_record["pllm_token_id"],
                 issuer_id_snapshot=token_record["issuer_id"],
                 subject_id_snapshot=token_record["subject_id"],
