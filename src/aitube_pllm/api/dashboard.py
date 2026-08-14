@@ -1589,7 +1589,9 @@ async def admin_console_page(request: Request):
     - 路径前缀 /admin/dashboard 已在签名中间件豁免 Ed25519 校验；SPA 内部用 localStorage
       存 token，所有数据接口仍受 token 保护，此处仅提供静态 UI 外壳。
     """
-    frontend_dir = Path(__file__).resolve().parent.parent.parent.parent / "frontend"
+    # 前端目录：镜像内默认 /app/frontend（Dockerfile COPY + compose 挂载 ./frontend），
+    # 也可用 PLLM_FRONTEND_DIR 覆盖（本地开发指向仓库 frontend 目录）。
+    frontend_dir = Path(os.environ.get("PLLM_FRONTEND_DIR", "/app/frontend"))
     html_path = frontend_dir / "pllm-admin.html"
     if not html_path.is_file():
         raise HTTPException(
