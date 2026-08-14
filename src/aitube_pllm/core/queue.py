@@ -137,6 +137,14 @@ class QueueRouter:
         self.free = {name: conc for name, conc in caps.items()}
         self.tier_models = tier_models
         self.default_model = default_model or (models[0]["model_name"] if models else None)
+        # 单模型（仅一个 enabled 模型）塌缩：三档都指向同一可用模型，
+        # 避免半限降级时因目标空档无模型而直接 504（符合「单模型三档塌缩」设计意图）。
+        enabled_names = [m["model_name"] for m in models if m.get("is_enabled")]
+        if len(enabled_names) == 1:
+            only = enabled_names[0]
+            for t in TIERS:
+                if not self.tier_models[t]:
+                    self.tier_models[t] = [only]
         logger.info(
             "队列路由模型已加载: %s",
             {t: {"models": tier_models[t], "cap": sum(caps[n] for n in tier_models[t])}
