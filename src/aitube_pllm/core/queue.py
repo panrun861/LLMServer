@@ -96,6 +96,7 @@ class QueueRouter:
         self.default_model: Optional[str] = None
         self.forward_fn: Optional[Callable[[QueueItem], Awaitable[None]]] = None
         self._workers: list[asyncio.Task] = []
+        self._tasks: set[asyncio.Task] = set()  # 持有在跑的转发协程，防 GC
         self._started = False
 
     # ------------------------------------------------------------------ 模型加载
@@ -191,14 +192,19 @@ class QueueRouter:
         while True:
             item = await self.queues[tier].get()
             try:
-                await self._process(item, tier)
+                await self._dispatch(item, tier)  # 只负责拿槽位 + 派发，不阻塞转发
             except Exception:  # noqa: BLE001 - worker 自愈，避免单点异常退出循环
                 logger.exception("队列 worker 异常 request_id=%s", item.request_id)
                 self._fail(item, 504, "队列处理异常")
             finally:
                 self.queues[tier].task_done()
 
-    async def _process(self, item: QueueItem, tier: str) -> None:
+    async def _dispatch(self, item: QueueItem, tier: str) -> None:
+        """并发派发：拿槽位成功后 create_task 后台转发，worker 立刻取下一个。
+
+        这是修复串行化瓶颈的关键——旧版 _process 在 worker 里 await 整条
+        forward_fn（httpx 往返），导致每挡位实际并发=1，Semaphore 形同虚设。
+        """
         waited = time.monotonic() - item.enqueued_at
         limit = self.wait_limit(tier)
         next_tier = _NEXT_TIER[tier]
@@ -232,11 +238,20 @@ class QueueRouter:
             self._fail(item, 504, "等待超时")
             return
 
-        # 3) 拿到槽位 → 转发（由注入的 forward_fn 执行实际 httpx 调用 + 录制）
+        # 3) 拿到槽位 → 登记占用，create_task 后台转发，本方法立刻返回
         item.target_model = model
         self.free[model] = self.free.get(model, 0) - 1
+        self.active[tier] += 1
+        task = asyncio.create_task(
+            self._forward_then_release(item, model, sem, tier),
+            name=f"queue-forward-{item.request_id}",
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _forward_then_release(self, item: QueueItem, model: str, sem: asyncio.Semaphore, tier: str) -> None:
+        """后台转发协程：执行实际的 httpx 转发 + 最终释放槽位。"""
         try:
-            self.active[tier] += 1
             if self.forward_fn is not None:
                 await self.forward_fn(item)
             else:
