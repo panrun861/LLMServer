@@ -252,6 +252,15 @@
       <div class="panel">
         <h2>对话测试</h2>
         <div class="current-model" id="chatModel">当前模型：加载中…</div>
+        <div class="chat-tier" style="margin:8px 0; display:flex; align-items:center; gap:8px;">
+          <label style="color:var(--muted); font-size:12px; margin:0;">挡位</label>
+          <select id="chatTier" style="background:#0c111c; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:6px 10px; font-size:13px;">
+            <option value="medium" selected>medium（中档）</option>
+            <option value="high">high（高档）</option>
+            <option value="low">low（低档）</option>
+          </select>
+          <span class="meta" style="font-size:12px;">默认中档，可切换 high / low</span>
+        </div>
         <div class="chat-box" id="chatBox"></div>
         <div class="chat-input">
           <textarea id="chatText" placeholder="输入消息，回车发送（Shift+Enter 换行）"></textarea>
@@ -279,6 +288,15 @@
     <div id="editApiKeyHint" class="hint" style="display:none;"></div>
     <label>启用 (is_enabled)</label>
     <input id="editEnabled" type="text" placeholder="true / false" />
+    <label>挡位 tier（重新分配队列挡位；选"（不修改）"=保持）</label>
+    <select id="editTier" style="background:#0c111c; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:7px 10px; font-size:13px;">
+      <option value="">（不修改）</option>
+      <option value="high">high（高档）</option>
+      <option value="medium">medium（中档）</option>
+      <option value="low">low（低档）</option>
+    </select>
+    <label>并发数量 concurrency（每模型并发闸；留空 = 不修改）</label>
+    <input id="editConcurrency" type="number" min="1" placeholder="如 8（默认 8）" style="background:#0c111c; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:7px 10px; font-size:13px;" />
     <label>runtime_params（JSON 对象，运行时参数）</label>
     <textarea id="editRuntime" placeholder='{"temperature":0.7,"max_tokens":1024}'></textarea>
     <div class="hint">例如默认采样参数、透传给 vLLM/LiteLLM 的扩展字段。</div>
@@ -344,10 +362,11 @@
     <label>tier（档位）</label>
     <select id="regTier">
       <option value="medium">medium（中档）</option>
-      <option value="premium">premium（高档）</option>
+      <option value="high">high（高档）</option>
       <option value="low">low（低档）</option>
-      <option value="high">high</option>
     </select>
+    <label>并发数量 concurrency（每模型并发闸，可选）</label>
+    <input id="regConcurrency" type="number" min="1" placeholder="留空 = 默认 8" style="background:#0c111c; border:1px solid var(--line); color:var(--txt); border-radius:8px; padding:7px 10px; font-size:13px;" />
     <label>runtime_params（JSON，可选）</label>
     <textarea id="regRuntime" placeholder='{}'></textarea>
     <label>request_params（JSON，可选）</label>
@@ -736,6 +755,11 @@ $("regSave").onclick = async ()=>{
   catch(e){ $("regErr").textContent = "runtime_params 不是合法 JSON"; return; }
   try { request = $("regRequest").value.trim() ? JSON.parse($("regRequest").value) : null; }
   catch(e){ $("regErr").textContent = "request_params 不是合法 JSON"; return; }
+  const concRaw = $("regConcurrency").value.trim();
+  if (concRaw && Number(concRaw) >= 1) {
+    runtime = runtime || {};
+    runtime.concurrency = Number(concRaw);
+  }
   const body = {
     model_name: name,
     model_artifact: artifact,
@@ -769,6 +793,11 @@ function openEdit(name, tier){
   if (m.api_key_masked) { keyHint.textContent = "当前 key：" + m.api_key_masked; keyHint.style.display = "block"; }
   else { keyHint.textContent = ""; keyHint.style.display = "none"; }
   $("editEnabled").value = m.is_enabled===false ? "false" : "true";
+  $("editTier").value = m.tier || "";
+  let _rpObj = null;
+  if (m.runtime_params && typeof m.runtime_params==="object") _rpObj = m.runtime_params;
+  else if (typeof m.runtime_params==="string" && m.runtime_params) { try { _rpObj = JSON.parse(m.runtime_params); } catch(e){} }
+  $("editConcurrency").value = (_rpObj && _rpObj.concurrency != null) ? _rpObj.concurrency : "";
   $("editRuntime").value = m.runtime_params && typeof m.runtime_params==="object" ? JSON.stringify(m.runtime_params,null,2) : (typeof m.runtime_params==="string"?m.runtime_params:"{}");
   $("editRequest").value = m.request_params ? JSON.stringify(m.request_params,null,2) : "{}";
   $("editErr").textContent = "";
@@ -791,6 +820,14 @@ $("editSave").onclick = async ()=>{
     runtime_params: runtime,
     request_params: request
   };
+  const newTier = $("editTier").value.trim();
+  if (newTier) body.tier = newTier;
+  const concRaw = $("editConcurrency").value.trim();
+  if (concRaw && Number(concRaw) >= 1) {
+    runtime = runtime || {};
+    runtime.concurrency = Number(concRaw);
+    body.runtime_params = runtime;
+  }
   const apiKey = $("editApiKey").value.trim();
   if (apiKey) body.api_key = apiKey;
   const artifact = $("editArtifact").value.trim();
@@ -867,7 +904,7 @@ async function sendChat(){
   try {
     const res = await fetch(c.base + "/v1/chat/completions", {
       method:"POST",
-      headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+c.token },
+      headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+c.token, "X-PLLM-Tier": ($("chatTier").value || "medium") },
       body: JSON.stringify({ model:_chatModel, messages:history.concat([{role:"user",content:text}]), stream:true, temperature:0.7, max_tokens:1024 })
     });
     if (!res.ok){ let msg="HTTP "+res.status; try{msg=(await res.json()).detail||msg}catch(e){} throw new Error(msg); }

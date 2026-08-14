@@ -10,6 +10,8 @@ from ..db import db, ModelRepo, AuditRepo
 from ..tasks.model_sync import sync_models_from_upstream
 from ..tasks.litellm_inject import inject_single_model
 from ..utils.crypto import encrypt, decrypt
+from ..config import settings
+from ..core.queue import queue_router
 
 router = APIRouter(prefix="/admin/models", tags=["Model Management"])
 
@@ -109,6 +111,12 @@ class ModelUpdateRequest(BaseModel):
     request_params: Optional[dict] = None
     is_enabled: Optional[bool] = None
     sync_status: Optional[str] = Field(None, pattern="^(pending|synced|failed)$")
+    tier: Optional[str] = Field(
+        None,
+        max_length=32,
+        pattern="^(high|medium|low)$",
+        description="重新分配模型所属队列挡位（high/medium/low）；留空=不修改",
+    )
 
 
 class TierActivateRequest(BaseModel):
@@ -187,6 +195,13 @@ async def register_model(body: ModelRegisterRequest, request: Request):
         "is_enabled": body.is_enabled,
     }
     litellm_result = await inject_single_model(litellm_data)
+
+    # 队列路由：新模型注册后重载并发闸
+    if settings.queue_enabled:
+        try:
+            await queue_router.refresh_from_db()
+        except Exception:  # noqa: BLE001
+            logger.exception("队列重载失败（模型注册后）")
 
     return {
         "id": model["id"],
@@ -338,6 +353,21 @@ async def update_model(model_name: str, tier: str, body: ModelUpdateRequest, req
                 old_upstream = (old_rp or {}).get("upstream_type")
                 if old_upstream and not new_rp.get("upstream_type"):
                     update_fields["runtime_params"] = {**new_rp, "upstream_type": old_upstream}
+        # 挡位重分配：tier 改动时校验目标挡位无同名模型，避免唯一冲突
+        new_tier = update_fields.pop("tier", None)
+        if new_tier and new_tier != model["tier"]:
+            if new_tier not in ("high", "medium", "low"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"无效挡位: {new_tier}（仅支持 high/medium/low）",
+                )
+            clash = await ModelRepo.get_by_name_and_tier(conn, model_name, new_tier)
+            if clash:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"挡位已存在同名模型: {model_name}:{new_tier}",
+                )
+            update_fields["tier"] = new_tier
         if not update_fields:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -371,6 +401,13 @@ async def update_model(model_name: str, tier: str, body: ModelUpdateRequest, req
     litellm_note = None
     if litellm_result:
         litellm_note = litellm_result.get("removed") or litellm_result.get("note")
+
+    # 队列路由：模型变更（含挡位/并发）后重载并发闸，使改动即时生效
+    if settings.queue_enabled:
+        try:
+            await queue_router.refresh_from_db()
+        except Exception:  # noqa: BLE001
+            logger.exception("队列重载失败（模型更新后）")
 
     return {
         "id": updated["id"],

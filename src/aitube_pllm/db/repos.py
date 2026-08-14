@@ -320,7 +320,7 @@ class ModelRepo:
         idx = 3
         for key in (
             "api_base", "api_key_encrypted", "model_artifact", "runtime_params", "request_params",
-            "is_enabled", "sync_status", "context_length", "last_synced_at",
+            "is_enabled", "sync_status", "context_length", "last_synced_at", "tier",
         ):
             if key in kwargs:
                 val = kwargs[key]

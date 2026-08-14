@@ -181,6 +181,9 @@ class ChatCompletionRequest(BaseModel):
     metadata: Optional[dict] = None
     service_tier: Optional[str] = None
 
+    # ---- PLLM 扩展：队列挡位选择（覆盖对话默认 medium）----
+    pllm_tier: Optional[str] = None
+
     # ---- vLLM 常用采样扩展（经 LiteLLM 透传）----
     repetition_penalty: Optional[float] = None
     top_k: Optional[int] = None
@@ -337,6 +340,11 @@ async def chat_completions(
                     ),
                 )
 
+    # 队列挡位选择：header X-PLLM-Tier > body.pllm_tier > 默认 medium
+    selected_tier = request.headers.get("X-PLLM-Tier") or body.pllm_tier
+    if selected_tier not in ("high", "medium", "low"):
+        selected_tier = None
+
     # 构造请求体：模型 request_params 作为默认值，客户端参数优先覆盖
     request_body = body.model_dump(exclude_none=True)
     rp = model_config.get("request_params")
@@ -379,6 +387,7 @@ async def chat_completions(
             correlation_id=correlation_id,
             start_time=start_time,
             is_stream=bool(body.stream),
+            selected_tier=selected_tier,
         )
 
     # ---- 否则走原直连转发（与历史行为一致，零回归）----
@@ -568,6 +577,7 @@ async def _route_via_queue(
     correlation_id: Optional[str],
     start_time: float,
     is_stream: bool,
+    selected_tier: Optional[str] = None,
 ):
     """将请求投入三级挡位队列并等待结果。
 
@@ -581,7 +591,7 @@ async def _route_via_queue(
         token_record=token_record,
         model_config=model_config,
         target_model=effective_model,
-        current_tier=(model_config.get("tier") or "medium"),
+        current_tier=(selected_tier or "medium"),
         is_stream=is_stream,
         correlation_id=correlation_id,
         start_time=start_time,
