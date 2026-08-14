@@ -692,10 +692,15 @@ function renderModelCards(items){
     const sync = m.sync_status==="synced" ? '<span class="tag ok">synced</span>'
                : m.sync_status==="failed" ? '<span class="tag bad">failed</span>'
                : '<span class="tag warn">'+esc(m.sync_status||"pending")+'</span>';
+    let _rp = null;
+    if (m.runtime_params && typeof m.runtime_params==="object") _rp = m.runtime_params;
+    else if (typeof m.runtime_params==="string" && m.runtime_params) { try { _rp = JSON.parse(m.runtime_params); } catch(e){} }
+    const conc = (_rp && _rp.concurrency != null) ? _rp.concurrency : "默认(8)";
     html += `<div class="mcard">
       <h3>${esc(m.model_name)} <span class="meta">:${esc(m.tier)}</span></h3>
       <div class="badges">${cur}${en}${sync}<span class="tag muted">${esc(m.upstream_type||"–")}</span></div>
       <div class="meta">
+        并发：${esc(String(conc))}<br>
         上下文：${fmt(m.context_length)}<br>
         API Base：${esc(m.api_base||"–")}<br>
         Key：${esc(m.api_key_masked||"–")}<br>
@@ -704,6 +709,7 @@ function renderModelCards(items){
       <div class="acts">
         <button class="primary" data-act="current" data-name="${esc(m.model_name)}" data-tier="${esc(m.tier)}">设为全局当前</button>
         <button data-act="edit" data-name="${esc(m.model_name)}" data-tier="${esc(m.tier)}">编辑参数</button>
+        <button data-act="delete" data-name="${esc(m.model_name)}" data-tier="${esc(m.tier)}" style="border-color:var(--bad);color:var(--bad)">删除</button>
       </div>
     </div>`;
   });
@@ -712,6 +718,7 @@ function renderModelCards(items){
     b.onclick = ()=>{
       if (b.dataset.act==="current") setCurrent(b.dataset.name, b.dataset.tier);
       else if (b.dataset.act==="edit") openEdit(b.dataset.name, b.dataset.tier);
+      else if (b.dataset.act==="delete") deleteModel(b.dataset.name, b.dataset.tier);
     };
   });
 }
@@ -724,6 +731,16 @@ async function setCurrent(name, tier){
     $("modelsMsg").textContent = "已设为当前 ✓";
     await refreshModels();
   } catch(e){ $("modelsErr").textContent = "切换失败: " + e.message; }
+}
+
+async function deleteModel(name, tier){
+  if (!confirm(`确认删除模型 ${name}:${tier}？\n此操作不可恢复；current（全局当前）档位不可删除，需先切换到其它档位。`)) return;
+  $("modelsMsg").textContent = "删除中…";
+  try {
+    await api(`/admin/models/${encodeURIComponent(name)}/tiers/${encodeURIComponent(tier)}`, {method:"DELETE", auth:"admin"});
+    $("modelsMsg").textContent = "已删除 ✓";
+    await refreshModels();
+  } catch(e){ $("modelsErr").textContent = "删除失败: " + e.message; }
 }
 
 $("modelsSync").onclick = async ()=>{
