@@ -501,7 +501,11 @@ async function loadSnapshot(){
     const q = await api("/admin/queue/status", {auth:"dash"});
     renderQueue(q);
   } catch(e){
-    $("queueMsg").textContent = "队列状态加载失败: " + e.message;
+    let hint = "";
+    if (e.message === "Failed to fetch"){
+      hint = "（网络层失败：请确认 ① 已部署含队列路由的新代码 ② 连接配置里的 API Base URL 正确 ③ 后端:8080 对该浏览器可达，且未被网关/防火墙拦截）";
+    }
+    $("queueMsg").textContent = "队列状态加载失败: " + e.message + hint;
   }
 }
 

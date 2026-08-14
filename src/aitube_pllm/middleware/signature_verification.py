@@ -28,8 +28,8 @@ class SignatureVerificationMiddleware(BaseHTTPMiddleware):
         if request.method == "OPTIONS":
             return await call_next(request)
 
-        # 仪表盘只读接口使用专用 token 认证，跳过 Ed25519 签名
-        if request.url.path.startswith("/admin/dashboard"):
+        # 仪表盘只读接口与队列路由状态/重载接口使用专用 token 认证，跳过 Ed25519 签名
+        if request.url.path.startswith("/admin/dashboard") or request.url.path.startswith("/admin/queue"):
             return await call_next(request)
 
         # 跳过 localhost CLI 端点（模型管理 / token 管理使用 x-local-admin 认证）
