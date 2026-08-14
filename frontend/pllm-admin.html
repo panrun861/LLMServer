@@ -707,7 +707,9 @@ function renderModelCards(items){
         更新：${esc((m.updated_at||"").replace("T"," "))}
       </div>
       <div class="acts">
-        <button class="primary" data-act="current" data-name="${esc(m.model_name)}" data-tier="${esc(m.tier)}">设为全局当前</button>
+        ${m.is_current
+          ? `<button class="danger" data-act="unset" data-name="${esc(m.model_name)}" data-tier="${esc(m.tier)}" style="border-color:var(--bad);color:var(--bad)">取消当前</button>`
+          : `<button class="primary" data-act="current" data-name="${esc(m.model_name)}" data-tier="${esc(m.tier)}">设为全局当前</button>`}
         <button data-act="edit" data-name="${esc(m.model_name)}" data-tier="${esc(m.tier)}">编辑参数</button>
         <button data-act="delete" data-name="${esc(m.model_name)}" data-tier="${esc(m.tier)}" style="border-color:var(--bad);color:var(--bad)">删除</button>
       </div>
@@ -717,6 +719,7 @@ function renderModelCards(items){
   $("modelCards").querySelectorAll("button").forEach(b=>{
     b.onclick = ()=>{
       if (b.dataset.act==="current") setCurrent(b.dataset.name, b.dataset.tier);
+      else if (b.dataset.act==="unset") unsetCurrent(b.dataset.name, b.dataset.tier);
       else if (b.dataset.act==="edit") openEdit(b.dataset.name, b.dataset.tier);
       else if (b.dataset.act==="delete") deleteModel(b.dataset.name, b.dataset.tier);
     };
@@ -733,8 +736,18 @@ async function setCurrent(name, tier){
   } catch(e){ $("modelsErr").textContent = "切换失败: " + e.message; }
 }
 
+async function unsetCurrent(name, tier){
+  if (!confirm(`确认取消 ${name}:${tier} 的「全局当前」标记？\n取消后网关将退回按客户端请求里的 model 字段路由；若仍要删除该模型，取消当前后再点删除即可。`)) return;
+  $("modelsMsg").textContent = "取消中…";
+  try {
+    const r = await api(`/admin/models/${encodeURIComponent(name)}/unset-current`, {method:"POST", auth:"admin"});
+    $("modelsMsg").textContent = `已取消当前 ✓（清除 ${r.cleared_current_rows} 条标记）`;
+    await refreshModels();
+  } catch(e){ $("modelsErr").textContent = "取消失败: " + e.message; }
+}
+
 async function deleteModel(name, tier){
-  if (!confirm(`确认删除模型 ${name}:${tier}？\n此操作不可恢复；current（全局当前）档位不可删除，需先切换到其它档位。`)) return;
+  if (!confirm(`确认删除模型 ${name}:${tier}？\n此操作不可恢复；current（全局当前）档位不可删除，需先点该卡片的「取消当前」（或把其它模型设为全局当前）。`)) return;
   $("modelsMsg").textContent = "删除中…";
   try {
     await api(`/admin/models/${encodeURIComponent(name)}/tiers/${encodeURIComponent(tier)}`, {method:"DELETE", auth:"admin"});

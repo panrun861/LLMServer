@@ -434,7 +434,7 @@ async def delete_model(model_name: str, tier: str, request: Request):
         if model["is_current"]:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Cannot delete the current tier. Activate another tier first.",
+                detail="Cannot delete the current model. Click 取消当前 first (or set another model as 全局当前), then delete.",
             )
 
         await ModelRepo.delete_row(conn, model_name, tier)
@@ -494,3 +494,27 @@ async def activate_tier(model_name: str, body: TierActivateRequest, request: Req
         "previous_tier": current_tier,
         "activated_at": activated["updated_at"].isoformat(),
     }
+
+
+@router.post("/{model_name}/unset-current")
+async def unset_current_model(model_name: str, request: Request):
+    """取消该模型的全局当前标记（is_current -> FALSE）。
+
+    用于：删除当前模型前先「取消当前」，或让网关退回按客户端 body.model 路由。
+    """
+    _require_local_admin(request)
+
+    async with db.pool.acquire() as conn:
+        cleared = await ModelRepo.unset_current(conn, model_name)
+        await AuditRepo.record_event(
+            conn,
+            actor_type="admin_cli",
+            actor_id="localhost",
+            action="tier_unset_current",
+            target_type="model",
+            target_id=model_name,
+            result="success",
+            detail={"cleared_rows": cleared},
+        )
+
+    return {"model_name": model_name, "cleared_current_rows": cleared}

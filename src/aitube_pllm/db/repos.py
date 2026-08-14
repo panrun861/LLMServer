@@ -362,6 +362,19 @@ class ModelRepo:
             )
 
     @staticmethod
+    async def unset_current(conn: asyncpg.Connection, model_name: str) -> int:
+        """取消该 model_name 的全局当前标记（is_current 全部置 FALSE）。
+
+        用于：删除当前模型前先「取消当前」，或单纯想让网关退回按客户端 body.model 路由。
+        返回被清除的行数。
+        """
+        result = await conn.execute(
+            "UPDATE models SET is_current = FALSE WHERE model_name = $1 AND is_current = TRUE",
+            model_name,
+        )
+        return int((result or "0").split()[-1])
+
+    @staticmethod
     async def exists(conn: asyncpg.Connection, model_name: str, tier: str) -> bool:
         return await conn.fetchval(
             "SELECT 1 FROM models WHERE model_name = $1 AND tier = $2",
