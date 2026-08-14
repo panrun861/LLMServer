@@ -408,6 +408,7 @@ async function api(path, opts={}){
 const $ = (id) => document.getElementById(id);
 function fmt(n){ return (n==null?0:n).toLocaleString(); }
 function fmtBytes(n){ if(n==null) return "–"; n=Number(n); const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+" "+u[i]; }
+function fmtPct(n, d=2){ if(n==null) return "–"; n=Number(n); return n.toFixed(d); }
 function esc(s){ return String(s==null?"":s).replace(/[&<>]/g, m=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[m])); }
 
 // ---------- tabs ----------
@@ -498,18 +499,18 @@ function renderSnapshot(d){
     const memPct = h.mem_total_bytes ? (h.mem_used_bytes/h.mem_total_bytes*100).toFixed(1) : "–";
     const diskPct = h.disk_total_bytes ? (h.disk_used_bytes/h.disk_total_bytes*100).toFixed(1) : "–";
     $("sysKpis").innerHTML = `
-      <div class="kpi"><div class="label">CPU 使用率</div><div class="value">${h.cpu_percent!=null?h.cpu_percent:"–"}%</div></div>
-      <div class="kpi"><div class="label">内存</div><div class="value">${memPct}%</div><div class="meta">${fmt(h.mem_used_bytes)}/${fmt(h.mem_total_bytes)}</div></div>
-      <div class="kpi"><div class="label">磁盘</div><div class="value">${diskPct}%</div><div class="meta">${fmt(h.disk_used_bytes)}/${fmt(h.disk_total_bytes)}</div></div>
-      <div class="kpi"><div class="label">负载(1m)</div><div class="value">${h.load_1m!=null?h.load_1m:"–"}</div></div>
+      <div class="kpi"><div class="label">CPU 使用率</div><div class="value">${fmtPct(h.cpu_percent)}%</div></div>
+      <div class="kpi"><div class="label">内存</div><div class="value">${memPct}%</div><div class="meta">${fmtBytes(h.mem_used_bytes)} / ${fmtBytes(h.mem_total_bytes)}</div></div>
+      <div class="kpi"><div class="label">磁盘</div><div class="value">${diskPct}%</div><div class="meta">${fmtBytes(h.disk_used_bytes)} / ${fmtBytes(h.disk_total_bytes)}</div></div>
+      <div class="kpi"><div class="label">负载(1m)</div><div class="value">${fmtPct(h.load_1m,2)}</div></div>
       <div class="kpi"><div class="label">运行时长</div><div class="value" style="font-size:16px">${h.uptime_seconds!=null?fmtUptime(h.uptime_seconds):"–"}</div></div>
       <div class="kpi"><div class="label">进程数</div><div class="value">${h.process_count!=null?h.process_count:"–"}</div></div>`;
     const gpu = sys.gpu || {};
     if (gpu.available){
       let g = `<tr><th>GPU</th><th>型号</th><th>利用率</th><th>显存</th><th>温度</th></tr>`;
       (gpu.gpus||[]).forEach(x=>{
-        g += `<tr><td>${x.index}</td><td>${esc(x.name)}</td><td>${x.utilization_percent}%</td>
-          <td>${fmt(Math.round(x.memory_used_mb*1048576))}/${fmt(Math.round(x.memory_total_mb*1048576))}</td><td>${x.temperature_c}°C</td></tr>`;
+        g += `<tr><td>${x.index}</td><td>${esc(x.name)}</td><td>${fmtPct(x.utilization_percent,1)}%</td>
+          <td>${fmtBytes(Math.round(x.memory_used_mb*1048576))} / ${fmtBytes(Math.round(x.memory_total_mb*1048576))}</td><td>${x.temperature_c}°C</td></tr>`;
       });
       $("gpuTable").innerHTML = g;
     } else { $("gpuTable").innerHTML = `<tr><td class="meta">GPU 不可用${gpu.error?"："+esc(gpu.error):""}</td></tr>`; }

@@ -1351,6 +1351,8 @@ document.querySelectorAll("#winbtns button").forEach(b => {
 
 function fmt(n){ return (n==null?0:n).toLocaleString(); }
 function fmtBytes(n){ if(n==null) return "–"; n=Number(n); const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+" "+u[i]; }
+function fmtPct(n, d=2){ if(n==null) return "–"; n=Number(n); return n.toFixed(d); }
+function fmtBytes(n){ if(n==null) return "–"; n=Number(n); const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n)+" "+u[i]; }
 function pct(n){ return (n*100).toFixed(2) + "%"; }
 function fmtUptime(s){ if(s==null) return "–"; s=Math.floor(s); const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60); return (d>0?d+"天 ":"")+h+"时"+m+"分"; }
 
@@ -1368,7 +1370,7 @@ function render(d){
   if (d.system && d.system.available && d.system.host){
     const h = d.system.host;
     const mp = h.mem_total_bytes ? (h.mem_used_bytes/h.mem_total_bytes*100).toFixed(1) : "–";
-    kpis.push(["主机CPU", (h.cpu_percent!=null?h.cpu_percent:"–") + "%"]);
+    kpis.push(["主机CPU", fmtPct(h.cpu_percent) + "%"]);
     kpis.push(["主机内存", mp + "%"]);
   }
   document.getElementById("kpis").innerHTML = kpis.map(k =>
@@ -1437,16 +1439,16 @@ function render(d){
     const memPct = h.mem_total_bytes ? (h.mem_used_bytes/h.mem_total_bytes*100).toFixed(1) : "–";
     const diskPct = h.disk_total_bytes ? (h.disk_used_bytes/h.disk_total_bytes*100).toFixed(1) : "–";
     document.getElementById("system").innerHTML = `<table>
-      <tr><th>CPU 使用率</th><td>${h.cpu_percent!=null?h.cpu_percent:"–"}%</td><th>负载(1m)</th><td>${h.load_1m!=null?h.load_1m:"–"}</td></tr>
-      <tr><th>内存</th><td>${fmt(h.mem_used_bytes)} / ${fmt(h.mem_total_bytes)} (${memPct}%)</td><th>进程数</th><td>${h.process_count!=null?h.process_count:"–"}</td></tr>
-      <tr><th>磁盘</th><td>${fmt(h.disk_used_bytes)} / ${fmt(h.disk_total_bytes)} (${diskPct}%)</td><th>运行时长</th><td>${h.uptime_seconds!=null?fmtUptime(h.uptime_seconds):"–"}</td></tr>
-      <tr><th>网络 ↓/↑</th><td colspan="3">${h.net_rx_kbps!=null?h.net_rx_kbps:"0"} / ${h.net_tx_kbps!=null?h.net_tx_kbps:"0"} KB/s （累计 ↓${fmt(h.net_rx_bytes)} ↑${fmt(h.net_tx_bytes)}）</td></tr>
+      <tr><th>CPU 使用率</th><td>${fmtPct(h.cpu_percent)}%</td><th>负载(1m)</th><td>${fmtPct(h.load_1m,2)}</td></tr>
+      <tr><th>内存</th><td>${fmtBytes(h.mem_used_bytes)} / ${fmtBytes(h.mem_total_bytes)} (${memPct}%)</td><th>进程数</th><td>${h.process_count!=null?h.process_count:"–"}</td></tr>
+      <tr><th>磁盘</th><td>${fmtBytes(h.disk_used_bytes)} / ${fmtBytes(h.disk_total_bytes)} (${diskPct}%)</td><th>运行时长</th><td>${h.uptime_seconds!=null?fmtUptime(h.uptime_seconds):"–"}</td></tr>
+      <tr><th>网络 ↓/↑</th><td colspan="3">${h.net_rx_kbps!=null?h.net_rx_kbps:"0"} / ${h.net_tx_kbps!=null?h.net_tx_kbps:"0"} KB/s （累计 ↓${fmtBytes(h.net_rx_bytes)} ↑${fmtBytes(h.net_tx_bytes)}）</td></tr>
     </table>`;
     const gpu = sys.gpu || {};
     if (gpu.available){
       document.getElementById("gpu").innerHTML = `<table><tr><th>GPU</th><th>型号</th><th>利用率</th><th>显存</th><th>温度</th></tr>` +
-        (gpu.gpus||[]).map(g=>`<tr><td>${g.index}</td><td>${g.name}</td><td>${g.utilization_percent}%</td>
-          <td>${fmt(Math.round(g.memory_used_mb*1048576))} / ${fmt(Math.round(g.memory_total_mb*1048576))}</td><td>${g.temperature_c}°C</td></tr>`).join("") + `</table>`;
+        (gpu.gpus||[]).map(g=>`<tr><td>${g.index}</td><td>${g.name}</td><td>${fmtPct(g.utilization_percent,1)}%</td>
+          <td>${fmtBytes(Math.round(g.memory_used_mb*1048576))} / ${fmtBytes(Math.round(g.memory_total_mb*1048576))}</td><td>${g.temperature_c}°C</td></tr>`).join("") + `</table>`;
     } else {
       document.getElementById("gpu").innerHTML = `<div class="meta">GPU 监控不可用${gpu.error?"："+gpu.error:""}</div>`;
     }
@@ -1459,7 +1461,7 @@ function render(d){
   document.getElementById("tblContainers").innerHTML =
     `<tr><th>容器</th><th>状态</th><th>CPU%</th><th>内存</th></tr>` +
     ((sys.containers) || []).map(c=>`<tr><td>${c.name}</td><td>${c.status}</td>
-      <td>${c.cpu_percent!=null?c.cpu_percent:"–"}</td><td>${c.mem_usage_bytes?fmt(c.mem_usage_bytes):"–"}</td></tr>`).join("");
+      <td>${c.cpu_percent!=null?c.cpu_percent:"–"}</td><td>${c.mem_usage_bytes?fmtBytes(c.mem_usage_bytes):"–"}</td></tr>`).join("");
 
   // models
   document.getElementById("models").innerHTML = `<table><tr><th>模型</th><th>档位</th><th>当前</th><th>启用</th><th>同步</th></tr>` +
