@@ -25,6 +25,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json as _json
 import os
+from pathlib import Path
 import socket as _socket
 import subprocess
 import time
@@ -1577,6 +1578,35 @@ async def dashboard_page(request: Request):
         )
     html = _DASHBOARD_HTML.replace("__TOKEN__", expected)
     return HTMLResponse(html)
+
+
+@router.get("/console", response_class=HTMLResponse)
+async def admin_console_page(request: Request):
+    """管理控制台 SPA（pllm-admin.html）由容器统一托管。
+
+    - 从磁盘实时读取文件（非打包进内存），配合 docker-compose 的 frontend 目录挂载，
+      改前端只需 git pull 即可生效，无需重建镜像；浏览器侧返回 no-cache 避免陈旧缓存。
+    - 路径前缀 /admin/dashboard 已在签名中间件豁免 Ed25519 校验；SPA 内部用 localStorage
+      存 token，所有数据接口仍受 token 保护，此处仅提供静态 UI 外壳。
+    """
+    frontend_dir = Path(__file__).resolve().parent.parent.parent.parent / "frontend"
+    html_path = frontend_dir / "pllm-admin.html"
+    if not html_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"管理控制台前端文件未找到: {html_path}",
+        )
+    try:
+        html = html_path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"读取前端文件失败: {e}",
+        )
+    return HTMLResponse(
+        html,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 # ========== 队列路由管理接口 ==========
