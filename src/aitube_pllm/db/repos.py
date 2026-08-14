@@ -313,10 +313,10 @@ class ModelRepo:
 
     @staticmethod
     async def update_row(
-        conn: asyncpg.Connection, model_name: str, tier: str, **kwargs
+        conn: asyncpg.Connection, model_name: str, lookup_tier: str, **kwargs
     ) -> dict | None:
         sets: list[str] = ["updated_at = NOW()"]
-        params: list[Any] = [model_name, tier]
+        params: list[Any] = [model_name, lookup_tier]
         idx = 3
         for key in (
             "api_base", "api_key_encrypted", "model_artifact", "runtime_params", "request_params",
