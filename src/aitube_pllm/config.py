@@ -90,6 +90,29 @@ class Settings(BaseSettings):
         description="AES 加密密钥（Base64 编码 32 字节），用于加密存储外部模型的 api_key",
     )
 
+    # 队列路由（三级挡位 tier 队列 + 每模型并发闸 + 半限降级）
+    # 默认关闭：false=回退到直连转发模式（零风险），true=启用三级队列路由
+    queue_enabled: bool = Field(
+        default=False,
+        description="是否启用三级挡位队列路由（false=回退直连转发）",
+    )
+    default_model_concurrency: int = Field(
+        default=8,
+        description="模型未在 runtime_params.concurrency 设置时的默认并发数（每模型 Semaphore 初始值）",
+    )
+    queue_tier_wait_limit_seconds: dict = Field(
+        default_factory=lambda: {"high": 60, "medium": 120, "low": 300},
+        description="每挡位最大等待时间(秒)：high/medium/low；半限软降级与硬超时都基于它",
+    )
+    queue_degrade_threshold_ratio: float = Field(
+        default=0.5,
+        description="半限降级比例：排队等待超过 本挡位 wait_limit × 该比例 即降级到下一挡位（默认½）",
+    )
+    queue_http_timeout_seconds: float = Field(
+        default=600.0,
+        description="非流式请求经队列转发的总超时(秒)，超时返回 504",
+    )
+
     # LiteLLM admin 配置（用于启动时动态注入外部模型）
     litellm_admin_url: str = Field(
         default="",

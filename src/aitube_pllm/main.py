@@ -15,8 +15,10 @@ from .api.model_management import router as model_router
 from .api.usage_and_audit import router as usage_audit_router
 from .api.inference_gateway import router as inference_router
 from .api.dashboard import router as dashboard_router
+from .api.dashboard import admin_queue_router
 from .tasks.model_sync import sync_models_from_upstream
 from .tasks.litellm_inject import inject_models_to_litellm
+from .core.queue import queue_router
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,15 @@ async def lifespan(app: FastAPI):
     if settings.model_sync_interval and settings.model_sync_interval > 0:
         sync_task = asyncio.create_task(_periodic_model_sync())
         logger.info("已启动周期模型同步（间隔 %ss）", settings.model_sync_interval)
+
+    # 队列路由：仅当启用时加载模型并发闸并启动 worker；失败则回退直连
+    if settings.queue_enabled:
+        try:
+            await queue_router.refresh_from_db()
+            queue_router.start()
+            logger.info("已启动三级队列路由（high/medium/low）")
+        except Exception:  # noqa: BLE001
+            logger.exception("队列路由启动失败（已忽略，回退直连转发）")
     yield
     if sync_task is not None:
         sync_task.cancel()
@@ -86,6 +97,7 @@ def create_app() -> FastAPI:
     app.include_router(usage_audit_router)
     app.include_router(inference_router)
     app.include_router(dashboard_router)
+    app.include_router(admin_queue_router)
     
     # 健康检查端点
     @app.get("/health")

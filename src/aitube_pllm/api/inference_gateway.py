@@ -1,5 +1,6 @@
 """推理网关 API - /v1/models 和 /v1/chat/completions"""
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -16,6 +17,7 @@ from pydantic import BaseModel, ConfigDict
 
 from ..config import settings
 from ..db import db, TokenRepo, ModelRepo, UsageRepo, AuditRepo
+from ..core.queue import QueueItem, queue_router, STREAM_SENTINEL, _HttpException
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +366,22 @@ async def chat_completions(
         "Content-Type": "application/json",
     }
 
+    # ---- 队列路由分支：投入三级挡位队列，由 worker 异步转发 ----
+    if settings.queue_enabled and queue_router.started:
+        return await _route_via_queue(
+            request_id=request_id,
+            request_body=request_body,
+            headers=headers,
+            litellm_url=litellm_url,
+            token_record=token_record,
+            model_config=model_config,
+            effective_model=effective_model,
+            correlation_id=correlation_id,
+            start_time=start_time,
+            is_stream=bool(body.stream),
+        )
+
+    # ---- 否则走原直连转发（与历史行为一致，零回归）----
     try:
         if body.stream:
             # 流式响应：httpx 客户端生命周期必须由生成器自身持有。
@@ -533,6 +551,241 @@ async def chat_completions(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"LiteLLM request failed: {e!s}",
         )
+
+
+# ---------------------------------------------------------------------------
+# 队列路由：请求入队 / 流式消费 / worker 转发回调
+# ---------------------------------------------------------------------------
+async def _route_via_queue(
+    *,
+    request_id: uuid.UUID,
+    request_body: dict,
+    headers: dict,
+    litellm_url: str,
+    token_record: dict,
+    model_config: dict,
+    effective_model: str,
+    correlation_id: Optional[str],
+    start_time: float,
+    is_stream: bool,
+):
+    """将请求投入三级挡位队列并等待结果。
+
+    非流式：结果经 ``item.future`` 返回；流式：逐行经 ``item.stream_q`` 返回。
+    """
+    item = QueueItem(
+        request_id=str(request_id),
+        request_body=request_body,
+        headers=headers,
+        litellm_url=litellm_url,
+        token_record=token_record,
+        model_config=model_config,
+        target_model=effective_model,
+        current_tier=(model_config.get("tier") or "medium"),
+        is_stream=is_stream,
+        correlation_id=correlation_id,
+        start_time=start_time,
+    )
+    await queue_router.enqueue(item)
+
+    if is_stream:
+        return StreamingResponse(
+            _stream_from_queue_item(item),
+            media_type="text/event-stream",
+            headers={"X-Request-Id": str(request_id)},
+        )
+
+    try:
+        await asyncio.wait_for(item.future, timeout=settings.queue_http_timeout_seconds)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="队列处理超时",
+        )
+    exc = item.future.exception()
+    if exc is not None:
+        if isinstance(exc, _HttpException):
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+        raise exc
+    _status_code, payload = item.future.result()
+    payload["request_id"] = str(request_id)
+    return JSONResponse(content=payload, headers={"X-Request-Id": str(request_id)})
+
+
+async def _stream_from_queue_item(item: QueueItem):
+    """从队列工作项消费流式 SSE 行，直到哨兵。"""
+    try:
+        while True:
+            chunk = await item.stream_q.get()
+            if chunk is STREAM_SENTINEL:
+                break
+            if isinstance(chunk, tuple) and chunk[0] == "error":
+                _, code, detail = chunk
+                yield (
+                    "data: "
+                    + json.dumps({"error": {"message": str(detail), "code": code}})
+                    + "\n\n"
+                )
+                break
+            else:
+                # 已是 "data: ...\n\n" 行
+                yield chunk
+    finally:
+        item.stream_done.set()
+
+
+async def _queue_forward(item: QueueItem) -> None:
+    """队列 worker 调用的实际转发：发往 LiteLLM 并录制 usage/审计。
+
+    非流式结果写入 ``item.future``（(status, json) 或异常）；
+    流式结果逐行写入 ``item.stream_q``，结束塞入 :data:`STREAM_SENTINEL`。
+    """
+    request_body = {**item.request_body, "model": item.target_model}
+    headers = item.headers
+    litellm_url = item.litellm_url
+    token_record = item.token_record
+    model_config = item.model_config
+    effective_model = item.target_model
+    tier_snapshot = item.current_tier
+    inference_engine = model_config.get("inference_engine")
+    correlation_id = item.correlation_id
+    start_time = item.start_time
+
+    try:
+        if item.is_stream:
+            prompt_tokens = completion_tokens = total_tokens = 0
+            upstream_status = 200
+            client = None
+            try:
+                client = httpx.AsyncClient(timeout=settings.queue_http_timeout_seconds)
+                async with client.stream(
+                    "POST", litellm_url, json=request_body, headers=headers
+                ) as response:
+                    upstream_status = response.status_code
+                    if response.status_code != 200:
+                        error_body = await response.aread()
+                        item.stream_q.put_nowait(
+                            ("error", response.status_code, error_body.decode())
+                        )
+                        item.stream_q.put_nowait(STREAM_SENTINEL)
+                        item.stream_done.set()
+                        await _record_usage(
+                            request_id=uuid.UUID(item.request_id),
+                            token_record=token_record,
+                            model_config={"tier": tier_snapshot,
+                                          "inference_engine": inference_engine},
+                            model_name=effective_model,
+                            prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                            latency_ms=int((time.time() - start_time) * 1000),
+                            status_code=response.status_code,
+                            correlation_id=correlation_id,
+                        )
+                        await _record_inference_audit(
+                            request_id=uuid.UUID(item.request_id),
+                            token_record=token_record,
+                            model_name=effective_model,
+                            status_code=response.status_code,
+                            result="error",
+                        )
+                        return
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: "):
+                            item.stream_q.put_nowait(line + "\n\n")
+                            if line == "data: [DONE]":
+                                break
+                            try:
+                                data = json.loads(line[6:])
+                                if "usage" in data:
+                                    usage = data["usage"]
+                                    prompt_tokens = usage.get("prompt_tokens", 0)
+                                    completion_tokens = usage.get("completion_tokens", 0)
+                                    total_tokens = usage.get("total_tokens", 0)
+                            except json.JSONDecodeError:
+                                pass
+            except httpx.TimeoutException:
+                upstream_status = 504
+            except httpx.RequestError:
+                upstream_status = 502
+            finally:
+                if client is not None:
+                    await client.aclose()
+                latency_ms = int((time.time() - start_time) * 1000)
+                await _record_usage(
+                    request_id=uuid.UUID(item.request_id),
+                    token_record=token_record,
+                    model_config={"tier": tier_snapshot,
+                                  "inference_engine": inference_engine},
+                    model_name=effective_model,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    latency_ms=latency_ms,
+                    status_code=upstream_status,
+                    correlation_id=correlation_id,
+                )
+                await _record_inference_audit(
+                    request_id=uuid.UUID(item.request_id),
+                    token_record=token_record,
+                    model_name=effective_model,
+                    status_code=upstream_status,
+                    result="success" if upstream_status == 200 else "error",
+                )
+                item.stream_q.put_nowait(STREAM_SENTINEL)
+                item.stream_done.set()
+        else:
+            async with httpx.AsyncClient(timeout=settings.queue_http_timeout_seconds) as client:
+                response = await client.post(
+                    litellm_url, json=request_body, headers=headers
+                )
+                if response.status_code != 200:
+                    await _record_inference_audit(
+                        request_id=uuid.UUID(item.request_id),
+                        token_record=token_record,
+                        model_name=effective_model,
+                        status_code=response.status_code,
+                        result="error",
+                    )
+                    item.future.set_exception(
+                        _HttpException(response.status_code, response.text)
+                    )
+                    return
+                result = response.json()
+                usage = result.get("usage", {})
+                await _record_usage(
+                    request_id=uuid.UUID(item.request_id),
+                    token_record=token_record,
+                    model_config={"tier": tier_snapshot,
+                                  "inference_engine": inference_engine},
+                    model_name=effective_model,
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0),
+                    total_tokens=usage.get("total_tokens", 0),
+                    latency_ms=int((time.time() - start_time) * 1000),
+                    status_code=200,
+                    correlation_id=correlation_id,
+                )
+                await _record_inference_audit(
+                    request_id=uuid.UUID(item.request_id),
+                    token_record=token_record,
+                    model_name=effective_model,
+                    status_code=200,
+                    result="success",
+                )
+                item.future.set_result((200, result))
+    except httpx.TimeoutException:
+        item.future.set_exception(_HttpException(504, "LiteLLM request timeout"))
+    except httpx.RequestError as e:
+        item.future.set_exception(
+            _HttpException(502, f"LiteLLM request failed: {e!s}")
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("队列转发异常 request_id=%s", item.request_id)
+        if not item.future.done():
+            item.future.set_exception(_HttpException(500, f"internal error: {e!s}"))
+
+
+# worker 通过回调注入转发逻辑，避免与网关模块形成循环依赖
+queue_router.forward_fn = _queue_forward
 
 
 # ---------------------------------------------------------------------------

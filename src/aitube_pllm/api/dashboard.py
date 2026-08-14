@@ -1577,3 +1577,38 @@ async def dashboard_page(request: Request):
         )
     html = _DASHBOARD_HTML.replace("__TOKEN__", expected)
     return HTMLResponse(html)
+
+
+# ========== 队列路由管理接口 ==========
+from ..core.queue import queue_router  # noqa: E402  (置于文件末尾，避免顶部循环依赖)
+
+admin_queue_router = APIRouter(prefix="/admin", tags=["Admin Queue"])
+
+
+def _require_dashboard_token(request: Request) -> None:
+    expected = settings.dashboard_token
+    token = _extract_token(request) or request.query_params.get("token")
+    if not expected or token != expected:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or missing dashboard token",
+        )
+
+
+@admin_queue_router.get("/queue/status")
+async def queue_status(request: Request):
+    """队列与可用模型状态（dashboard token 鉴权）。
+
+    返回三挡位(high/medium/low)的 queued / active / limit(=该挡位并发总量) / models，
+    以及全局默认模型与 queue_enabled 开关。
+    """
+    _require_dashboard_token(request)
+    return queue_router.status()
+
+
+@admin_queue_router.post("/queue/reload")
+async def queue_reload(request: Request):
+    """模型增删改后重载并发闸与挡位映射（dashboard token 鉴权）。"""
+    _require_dashboard_token(request)
+    await queue_router.refresh_from_db()
+    return {"ok": True, "status": queue_router.status()}

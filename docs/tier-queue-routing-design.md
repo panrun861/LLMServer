@@ -1,7 +1,8 @@
 # PLLM 模型分级队列路由设计（高/中/低三级）
 
-> 状态：设计稿 v1，待确认后实现
+> 状态：v2 已实现（2026-08-14 落地于 `src/aitube_pllm/core/queue.py` + `inference_gateway.py` 接入 + `/admin/queue/status` 接口）
 > 关联：旧方案 `docs/multilevel-queue-plan.md`（按「请求难度」分级）与本方案（按「模型等级」分级）是两个不同维度，本方案取代前者作为主路径。
+> 变更：v2 将 v1 的"固定 10 分钟超时降级"升级为**每挡位独立 wait_limit + 超过½即软降级**；并发数改为每模型独立（存 `runtime_params.concurrency`，免 DB 迁移）。
 
 ## 1. 需求一句话
 
@@ -14,7 +15,7 @@
 | 等级 tier | 复用 `models.tier`，约定三档：`high` / `medium` / `low` |
 | 默认模型 | `models.is_current = true` 的那个（现有机制，`get_current_model_name`） |
 | 等待序列 | 每个等级一个 `asyncio.Queue`（不设上限，无限排队）；**同等级的模型共享一个队列** |
-| 并发闸 | **每个模型一个 `asyncio.Semaphore`**，并发数 `concurrency` 在注册模型时单独设置（模型之间可不同） |
+| 并发闸 | **每个模型一个 `asyncio.Semaphore`**，并发数 `concurrency` 在注册模型时单独设置（模型之间可不同）；**数值存于 `models.runtime_params.concurrency`**（JSON），避免新增 DB 列/迁移。未设置时回退 `default_model_concurrency` |
 | 降级 | 从当前等级转移到下一等级继续排队/转发 |
 
 ## 3. 路由决策流程（核心）
@@ -36,14 +37,21 @@
                → low 也没有 → 默认模型
 ```
 
-### 降级触发（两条路径）
+### 降级触发（三条路径）
 
-1. **等级无模型**：当前等级没有任何 `is_enabled=true` 的模型 → 立即降级下一等级。
-2. **排队超时**：请求在队列里等待超过 **10 分钟**（可配）→ 自动转移到下一等级的队列尾部重新排队。
+1. **等级无模型**：当前等级没有任何 `is_enabled=true` 的模型 → 立即降级下一等级；若已是最低等级仍无模型 → 直接返回 504。
+2. **半限软降级（核心）**：请求在队列里等待的时间 `waited = now - enqueued_at`：
+   - 在**非最低挡位**且 `waited > wait_limit × degrade_threshold_ratio`（默认 `ratio=0.5`，即**超过本挡位限制的一半**）仍拿不到并发槽位时 → 转移到**下一等级队列尾部**重新排队（保留 `enqueued_at`，总等待连续累计，不会因降级而重置）。
+   - 在**最低挡位**且 `waited > wait_limit`（**硬超时**）→ 返回 504「系统繁忙请重试」。
+   - 软降级（½）的目的：在命中硬超时之前主动把请求往更宽松的挡位挪，显著降低**尾延迟**；真正走到 504 的概率被压低。
+3. **挡位内最空闲兄弟模型**：同一挡位挂多个模型时，worker 优先挑选「**剩余并发槽位最多**」的模型（而非永远钉死 current），实现挡位内的负载均衡。
+
+> 示例数值（默认）：high `wait_limit=60s` → 软降级阈值 **30s**；medium `120s` → **60s**；low `300s` → **150s**。请求在 high 等 >30s 即尝试 medium；medium 等 >60s 即尝试 low；low 等 >150s → 504。
 
 ### 降级后用什么模型
 
 - 降到某等级后，用该等级的「**默认模型**」：优先该等级内 `is_current=true` 的模型，否则取该等级最近更新（`updated_at DESC`）的 enabled 模型。
+- **同挡位多模型**：实际转发前再由 worker 按「剩余槽位最多」原则在挡位内挑一个（见上面第 3 条）。
 - 兜底：`low` 也没有 → 用全局默认模型（`is_current`）。
 
 ## 4. 队列与并发闸（两层正交）
@@ -89,17 +97,19 @@ async def worker(level):
 }
 ```
 
-- `queued`：排队等待数；`active`：正在转发数；`limit`：并发上限；`models`：该等级可用（enabled）模型名列表。
+- `queued`：排队等待数；`active`：正在转发数；`limit`：并发上限（= 该挡位所有模型 `concurrency` 之和，即挡位总容量）；`models`：该等级可用（enabled）模型名列表。
 
-## 6. 配置项（config.py 新增）
+## 6. 配置项（config.py 新增，均带 `PLLM_` 前缀）
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `default_model_concurrency` | `8` | 模型未填 `concurrency` 时的默认并发数 |
-| `queue_downgrade_timeout_seconds` | `600` | 排队超时降级阈值（10 分钟） |
-| `queue_enabled` | `true` | 总开关（可一键回退到当前直连模式） |
+| `queue_enabled` | `false` | **总开关**。`false`=回退到当前直连转发模式（零风险）；`true`=启用三级队列路由 |
+| `default_model_concurrency` | `8` | 模型未在 `runtime_params.concurrency` 设置时的默认并发数（每模型 Semaphore 初始值） |
+| `queue_tier_wait_limit_seconds` | `{"high":60,"medium":120,"low":300}` | **每挡位最大等待时间(秒)**，半限软降级与硬超时都基于它 |
+| `queue_degrade_threshold_ratio` | `0.5` | 半限降级比例：等待超过 `wait_limit × 该值` 即降级到下一挡位 |
+| `queue_http_timeout_seconds` | `600` | 非流式请求转发给上游的总超时(秒)，超时返回 504 |
 
-> 注：并发数不再用全局 `queue_tier_concurrency`，改为**每个模型的 `concurrency` 字段**（存 `models` 表，注册/编辑时设置）。
+> 并发数 `concurrency` 存于 `models.runtime_params.concurrency`（JSON），**无需新增 DB 列 / 迁移**；模型管理 API 在 `runtime_params` 里写入即可。每次模型增删改后调用 `POST /admin/queue/reload` 让路由重新加载并发闸。
 
 ## 7. 前端展示
 
@@ -140,18 +150,19 @@ async def worker(level):
 - 本方案：按模型 tier 分 high/medium/low。
 - 两者**正交**，可后续叠加（等级内再按难度细分），但第一版只做「按模型等级」，避免过度设计。
 
-## 11. 实现步骤（确认后执行）
+## 11. 实现步骤（已于 2026-08-14 完成）
 
-1. `config.py` 加 3 个配置项。
-2. 新建 `src/aitube_pllm/core/queue.py`：三级 `Queue` + `Semaphore` + worker 协程 + 队列状态快照函数。
-3. `inference_gateway.py`：改写 `chat_completions` 路由——不认识→默认模型；认识→按 tier 进队列；接入超时降级。
-4. 新增 `GET /admin/queue/status` 接口。
-5. 前端「状态总览」加队列面板。
-6. 提交 / 部署 / 端到端验证。
+1. ✅ `config.py` 加 5 个配置项（见 §6）。
+2. ✅ 新建 `src/aitube_pllm/core/queue.py`：三级 `Queue` + 每模型 `Semaphore` + 每挡位常驻 worker 协程 + 半限降级 + 状态快照函数。**转发动作通过 `queue_router.forward_fn` 回调注入**（由 `inference_gateway` 注册），避免与网关模块形成循环依赖。
+3. ✅ `inference_gateway.py`：`chat_completions` 路由分支——`queue_enabled` 且路由已启动 → 入队并 await；否则走原直连转发（保留现有逻辑，零回归风险）。
+4. ✅ 新增 `GET /admin/queue/status`（dashboard token 鉴权）+ `POST /admin/queue/reload`（模型变更后重载并发闸）。
+5. ✅ 前端「状态总览」加队列面板（轮询 `/admin/queue/status`）。
+6. ⬜ 提交 / 部署 / 端到端验证（部署需 `docker compose up -d --build app` 并在服务器执行 `POST /admin/queue/reload`；开启需设 `PLLM_QUEUE_ENABLED=true`）。
 
-## 12. 待确认项（请拍板）
+## 12. 设计决策（v2 拍板结果）
 
-1. **等级映射**：现有模型 tier 有 `medium/premium/test`，是否统一为 `high/medium/low`？`premium`→high、`test`→low 是否 OK？
-2. **超时降级后模型选择**：降级用下一等级的「current 或最近更新」模型，是否符合预期？
-3. **线程池默认值**：high=32 / medium=8 / low=2 是否合适（L40S + 硅基流动配额）？
-4. **是否保留旧「按难度」方案**：建议先不叠加，只做按等级，确认一下。
+1. **等级映射**：`tier` 仅接受 `high/medium/low`；模型注册时填写，未知/缺失值归一化为 `medium`。不再使用旧的 `premium/test`。
+2. **降级后模型选择**：下一挡位先取 `is_current=true` 的模型；同挡位内转发瞬间再由 worker 挑「剩余槽位最多」的兄弟模型。
+3. **并发不再用全局挡位并发数**，改为每模型独立 `concurrency`（存 `runtime_params`），更贴合"每模型不同并发量"的诉求。
+4. **旧「按难度分级」方案不叠加**，本方案为唯一主路径。
+5. **安全开关**：`queue_enabled` 默认 `false`，上线后手动开启；关闭即回退直连，可随时熔断。

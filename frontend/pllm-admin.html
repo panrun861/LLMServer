@@ -175,6 +175,12 @@
             <div id="inferenceBlock" class="meta" style="margin-top:10px;"></div>
           </div>
         </div>
+        <div class="panel">
+          <h2>队列路由（三级挡位 / 每模型并发 / 半限降级）</h2>
+          <div id="queueMsg" class="meta">队列未启用或未加载。</div>
+          <div id="queueKpis" class="row" style="margin-top:12px;"></div>
+          <div class="scroll"><table id="queueTable"></table></div>
+        </div>
       </div>
 
       <div class="panel">
@@ -490,6 +496,45 @@ async function loadSnapshot(){
   } catch(e){
     $("sysMsg").textContent = "快照加载失败: " + e.message;
   }
+  // 队列路由状态
+  try {
+    const q = await api("/admin/queue/status", {auth:"dash"});
+    renderQueue(q);
+  } catch(e){
+    $("queueMsg").textContent = "队列状态加载失败: " + e.message;
+  }
+}
+
+function renderQueue(q){
+  if (!q || !q.queue_enabled){
+    $("queueMsg").textContent = "队列路由未启用（PLLM_QUEUE_ENABLED=false）。当前为直连转发模式。";
+    $("queueKpis").innerHTML = "";
+    $("queueTable").innerHTML = "";
+    return;
+  }
+  $("queueMsg").textContent = "默认模型：" + esc(q.default_model || "–");
+  const tiers = q.tiers || {};
+  const order = ["high","medium","low"];
+  let kpis = "";
+  order.forEach(t=>{
+    const t0 = tiers[t] || {};
+    const pct = t0.limit ? Math.round((t0.active/t0.limit)*100) : 0;
+    kpis += `<div class="kpi"><div class="label">${t.toUpperCase()} 挡位</div>
+      <div class="value">${t0.active}/${t0.limit}</div>
+      <div class="meta">排队 ${t0.queued} · 并发 ${pct}%</div></div>`;
+  });
+  $("queueKpis").innerHTML = kpis;
+  let html = `<tr><th>挡位</th><th>排队</th><th>占用</th><th>上限</th><th>可用模型</th></tr>`;
+  order.forEach(t=>{
+    const t0 = tiers[t] || {};
+    html += `<tr>
+      <td><b>${t.toUpperCase()}</b></td>
+      <td>${t0.queued!=null?t0.queued:"–"}</td>
+      <td>${t0.active!=null?t0.active:"–"}</td>
+      <td>${t0.limit!=null?t0.limit:"–"}</td>
+      <td class="wrap2">${(t0.models||[]).map(esc).join("、")||"–"}</td></tr>`;
+  });
+  $("queueTable").innerHTML = html;
 }
 
 function renderSnapshot(d){
