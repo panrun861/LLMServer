@@ -1,4 +1,4 @@
-"""推理网关 API - /v1/models 和 /v1/chat/completions"""
+"""推理网关 API - /v1/chat/completions（OpenAI 兼容推理端点）"""
 
 import asyncio
 import hashlib
@@ -83,56 +83,6 @@ class BearerAuth:
 
 
 bearer_auth = BearerAuth()
-
-
-# ---------------------------------------------------------------------------
-# 外部管理认证（依赖签名验证中间件写入的 request.state.issuer_id）
-# ---------------------------------------------------------------------------
-async def require_external_admin(request: Request) -> str:
-    """要求请求已通过 Ed25519 签名验证（由 SignatureVerificationMiddleware 写入 issuer_id）。
-
-    用于 /v1/models 等原本走 Bearer 的查询端点迁移到 Ed25519 后，
-    在路由层二次确认签名身份已注入。中间件已保证未验签请求不会到达此处。
-    """
-    issuer_id = getattr(request.state, "issuer_id", None)
-    if not issuer_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="External admin authentication required (Ed25519 signature)",
-        )
-    return issuer_id
-
-
-# ---------------------------------------------------------------------------
-# /v1/models
-# ---------------------------------------------------------------------------
-@router.get("/models")
-async def list_models(admin_issuer: str = Depends(require_external_admin)):
-    """列出可用模型
-
-    从数据库查询当前有效的模型，并附加 context_length 信息。
-    """
-    async with db.pool.acquire() as conn:
-        models = await ModelRepo.list_all(conn)
-
-    enabled_models = [m for m in models if m["is_enabled"]]
-
-    data = []
-    for m in enabled_models:
-        data.append({
-            "id": m["model_name"],
-            "object": "model",
-            "created": int(m["created_at"].timestamp()),
-            "owned_by": "aitube-pllm",
-            "context_length": m["context_length"],
-            "tier": m["tier"],
-            "inference_engine": m["inference_engine"],
-        })
-
-    return {
-        "object": "list",
-        "data": data,
-    }
 
 
 # ---------------------------------------------------------------------------

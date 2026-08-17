@@ -18,14 +18,10 @@ class SignatureVerificationMiddleware(BaseHTTPMiddleware):
     """外部管理 API 的 Ed25519 签名验证"""
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        # 仅对 /admin/* 路径以及受 Ed25519 保护的 /v1 查询端点进行签名验证。
-        # 注意：/v1/chat/completions 等推理端点保持 Bearer 认证，绝不能纳入此范围。
+        # 仅对 /admin/* 路径进行 Ed25519 签名验证。
+        # 注意：/v1/chat/completions 等推理端点保持 Bearer 认证，绝不纳入此范围。
         path = request.url.path
-        if not (
-            path.startswith("/admin/")
-            or path == "/v1/models"
-            or path == "/v1/usage"
-        ):
+        if not path.startswith("/admin/"):
             return await call_next(request)
 
         # 放行浏览器 CORS 预检（OPTIONS）。预检请求不含业务签名头，

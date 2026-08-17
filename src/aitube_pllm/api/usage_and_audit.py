@@ -51,7 +51,7 @@ async def require_external_admin(request: Request) -> str:
 # ========== 使用统计API ==========
 
 
-@router.get("/v1/usage")
+@router.get("/admin/usage-summary")
 async def get_usage_summary(
     request: Request,
     days: int = Query(7, ge=1, le=30),

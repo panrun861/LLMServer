@@ -33,7 +33,7 @@
 ## 2. 设计决策（已与用户确认）
 
 - **D1 强制模型必须是“当前可用模型”**：即已在 `models` 表中登记、且 `is_current=TRUE`、`is_enabled=TRUE`。未满足则请求返回 404（沿用现有白名单语义，不绕过）。
-- **D2 `/v1/models` 仍返回全部已启用模型**；仅 `chat/completions` 请求被强制到单一模型。
+- **D2 `/v1/models` 端点已移除**（模型列表改由管理端点 `/admin/models` 提供）；仅 `chat/completions` 请求被强制到单一模型。
 - **D3 与 `activate_tier` 关系**：新增的全局覆盖是**叠在 `is_current` 之上的一层 client-model-agnostic 覆盖**，二者正交。建议强制模型值取自“当前可用模型”之一。
 
 ---
@@ -71,7 +71,7 @@
 |---|---|---|
 | 客户端传 `model:"gpt-4"`，`PLLM_FORCE_MODEL="qwen3.6-27b"` | 查 `gpt-4` 白名单，命中则转 LiteLLM 的 `gpt-4` | 忽略 `gpt-4`，统一转 LiteLLM 的 `qwen3.6-27b`（须为当前可用模型） |
 | 客户端传不存在的模型名 | 404 | 仍走 `qwen3.6-27b`（不再 404） |
-| `/v1/models` | 返回全部已启用 | **不变**，仍返回全部已启用 |
+| `/admin/models` | 列出已启用模型 | 管理端点（Ed25519/x-local-admin），替代原 `/v1/models` |
 | 计费/审计记录 | `body.model` | `effective_model`（真实服务的模型） |
 
 ---
@@ -98,7 +98,7 @@
 4. 验证：
    - 用错模型名调用 `POST /v1/chat/completions` `{"model":"whatever",...}` → 正常返回，实际走 `PLLM_FORCE_MODEL` 指定模型。
    - `usage_logs.model` 与 `event_logs.target_id` 应为 `effective_model`（真实服务模型）。
-   - `/v1/models` 仍列出全部已启用模型。
+   - 模型列表改由 `/admin/models`（管理端点）提供；原 `/v1/models` 已移除。
 
 ---
 

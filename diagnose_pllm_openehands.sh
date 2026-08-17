@@ -40,22 +40,23 @@ else
   exit 1
 fi
 
-# ---------- Step 2: Token 鉴权 ----------
-c_yellow "[2/4] Token 鉴权  GET /v1/models"
+# ---------- Step 2: Token 鉴权 + 推理连通 ----------
+c_yellow "[2/4] Token 鉴权 + 推理连通  POST /v1/chat/completions"
 if [ -z "$TOKEN" ]; then
   c_red "  ✗ 未提供 TOKEN 参数。请先 POST /admin/pllm-tokens 签发一个 pllm_sk_… 再跑此脚本。"
   exit 1
 fi
-RESP=$(curl -sS -m 8 -w '\n__HTTP_CODE__%{http_code}' \
+RESP=$(curl -sS -m 30 -w '\n__HTTP_CODE__%{http_code}' \
        -H "Authorization: Bearer $TOKEN" \
-       "$BASE_URL/v1/models" 2>&1)
+       -H "Content-Type: application/json" \
+       -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":16}" \
+       "$BASE_URL/v1/chat/completions" 2>&1)
 CODE=$(printf '%s' "$RESP" | sed -n 's/.*__HTTP_CODE__//p')
 BODY=$(printf '%s' "$RESP" | sed 's/__HTTP_CODE__.*//')
 case "$CODE" in
   200)
-    c_green "  ✓ 200  Token 有效"
-    printf "  实际暴露的 model id:\n"
-    printf '%s' "$BODY" | grep -o '"id":"[^"]*"' | sed 's/^/    /'
+    c_green "  ✓ 200  Token 有效 + 模型 '$MODEL' 存在 + 推理链路通"
+    printf "  响应片段: %s\n" "$(printf '%s' "$BODY" | head -c 200)"
     ;;
   401)
     c_red "  ✗ 401 Invalid or expired token"
@@ -63,22 +64,34 @@ case "$CODE" in
     c_red "    修复: 通过 POST /admin/pllm-tokens (Ed25519 签名) 签发新 token，填到 OpenHands UI 的 API 密钥。"
     exit 2
     ;;
+  404)
+    c_red "  ✗ 404 Model not found —— 模型名仍不对"
+    c_red "  → 你在 OpenHands UI 填的 'openai/qwen3.6-local' 多了 provider 前缀。"
+    c_red "    PLLM 直接按 body.model 精确匹配 DB，不带 openai/ 前缀。"
+    c_red "    修复: OpenHands UI → 自定义模型 改成裸名 (如 qwen3.6-local)。"
+    exit 3
+    ;;
+  429)
+    c_yellow "  ⚠ 429 Rate limit / 预算超限"
+    printf "  %s\n" "$BODY"
+    exit 4
+    ;;
   *)
     c_red "  ✗ HTTP $CODE  $BODY"
     exit 2
     ;;
 esac
 
-# ---------- Step 3: 模型名是否正确 ----------
-c_yellow "[3/4] 模型名匹配  查询 DB 里是否存在 '$MODEL'"
-if printf '%s' "$BODY" | grep -q "\"id\":\"$MODEL\""; then
-  c_green "  ✓ PLLM 数据库里有 model_name = '$MODEL'"
-else
-  c_red "  ✗ PLLM 数据库里没有 '$MODEL'"
-  c_red "  → 你在 OpenHands UI 填的 'openai/qwen3.6-local' 多了 provider 前缀。"
-  c_red "    PLLM 直接按 body.model 精确匹配 DB，不带 openai/ 前缀。"
-  c_red "    修复: OpenHands UI → 自定义模型 改成裸名 (如 qwen3.6-local)。"
+# ---------- Step 3: 模型名匹配 ----------
+c_yellow "[3/4] 模型名匹配  校验裸模型名 '$MODEL'"
+if [ "$CODE" = "200" ]; then
+  c_green "  ✓ PLLM 接受裸模型名 '$MODEL'（Step 2 已端到端验证）"
+elif [ "$CODE" = "404" ]; then
+  c_red "  ✗ 模型名 '$MODEL' 未通过校验（见 Step 2 的 404 提示）"
   exit 3
+else
+  c_red "  ✗ Step 2 未通过，模型名匹配无法继续"
+  exit 2
 fi
 
 # ---------- Step 4: 端到端推理 ----------
