@@ -1,12 +1,13 @@
 # PLLM 模型分级队列路由设计（高/中/低三级）
 
-> 状态：v2 已实现（2026-08-14 落地于 `src/aitube_pllm/core/queue.py` + `inference_gateway.py` 接入 + `/admin/queue/status` 接口）
+> 状态：v2.1 已实现（v2 于 2026-08-14 落地 `src/aitube_pllm/core/queue.py` + `inference_gateway.py` 接入 + `/admin/queue/status`；v2.1 于同日修复并发派发串行化瓶颈，见 §13）
 > 关联：旧方案 `docs/multilevel-queue-plan.md`（按「请求难度」分级）与本方案（按「模型等级」分级）是两个不同维度，本方案取代前者作为主路径。
 > 变更：v2 将 v1 的"固定 10 分钟超时降级"升级为**每挡位独立 wait_limit + 超过½即软降级**；并发数改为每模型独立（存 `runtime_params.concurrency`，免 DB 迁移）。
+> 变更(v2.1)：worker 内 `await forward_fn`（整条 httpx 往返阻塞 worker）重构为 `_dispatch` 拿槽位后 `create_task(_forward_then_release)` 后台并发转发，使每挡位真实并发 = `Semaphore(N)`（修复前实际并发恒=1）。
 
 ## 1. 需求一句话
 
-客户端请求一个模型名，系统按**模型自身的等级（tier：high / medium / low）**分流到三个独立等待队列 + 线程池；某等级不可用或排队过久时**自动降级**到下一等级；最低等级也没有就落到**默认模型**兜底。同时提供**队列与可用模型的可视化查看**。
+客户端请求一个模型名，系统按**模型自身的等级（tier：high / medium / low）**分流到三个独立等待队列 + 每模型并发闸（`asyncio.Semaphore`）；某等级不可用或排队过久时**自动降级**到下一等级；最低等级也没有就落到**默认模型**兜底。同时提供**队列与可用模型的可视化查看**。
 
 ## 2. 核心概念
 
@@ -30,7 +31,7 @@
         取 M.tier = L（high / medium / low）
         │
         ├─ L 等级有可用模型（该等级存在 enabled 模型）
-        │      → 进入 L 等级队列，由 L 线程池转发
+        │      → 进入 L 等级队列，由 L 挡位 worker 经并发闸转发（见 §13 并发派发）
         │
         └─ L 等级无可用模型（异常：M 刚被禁用等）
                → 降级到下一等级（high→medium→low）
@@ -80,7 +81,7 @@ async def worker(level):
 
 - 每个模型注册时填 `concurrency`（并发数），如模型 A=32、模型 B=16、模型 C=2。
 - 同等级的模型共享一个队列（先到先服务），但转发时各用各的并发闸，互不干扰。
-- 每级一个常驻 worker 协程。
+- 每级一个常驻 worker 协程（**仅负责取件 + 派发**，不阻塞转发，见 §13）。
 
 ## 5. 队列状态查询（新增接口）
 
@@ -133,7 +134,7 @@ async def worker(level):
    │    │    │
    └────┴────┴─► worker ──► LiteLLM ──► 上游
                      │
-                     ├─ 排队超 10min ──► 下一等级队列
+                     ├─ 等待超半限(wait_limit×½) ──► 下一等级队列（软降级）
                      └─ 结果/异常写回 future ──► 唤醒请求
 ```
 
@@ -166,3 +167,31 @@ async def worker(level):
 3. **并发不再用全局挡位并发数**，改为每模型独立 `concurrency`（存 `runtime_params`），更贴合"每模型不同并发量"的诉求。
 4. **旧「按难度分级」方案不叠加**，本方案为唯一主路径。
 5. **安全开关**：`queue_enabled` 默认 `false`，上线后手动开启；关闭即回退直连，可随时熔断。
+
+## 13. 并发派发修正（v2.1 / commit 721e0da，2026-08-14）
+
+### 13.1 背景：串行化瓶颈
+v2 的 worker 在 `_process` 里直接 `await forward_fn(item)`（整条 httpx 往返），
+意味着 worker 必须等 vLLM 返回后才去取下一个请求。结果**每挡位同一时刻只有 1 条
+请求在真正转发**，每模型 `Semaphore(N)` 并发闸形同虚设。200 并发压测时请求全挤在中档
+排队、等超 60s 半限后被软降级丢到低档 `qwen3-8b` 外部 API（实测 `/admin/queue/status`
+的 `active` 恒 ≤1）。
+
+### 13.2 修复：worker 只派发，转发交后台协程
+把 `_process` 拆为两步（均在 `src/aitube_pllm/core/queue.py`）：
+
+- `_dispatch(item, tier)`：只做「选最空闲兄弟模型 → `sem.acquire()` 抢槽位 → 登记占用 →
+  `create_task(_forward_then_release(...))` 后台并发转发」，方法**拿到槽位立即返回**，
+  worker 马上回头 `queues[tier].get()` 取下一个。
+- `_forward_then_release(item, model, sem, tier)`：后台协程执行实际 httpx 转发
+  （经 `forward_fn` 回调注入），`finally` 里 `active[tier] -= 1`、`free[model] += 1`、
+  `sem.release()`，无论成败都释放槽位。
+
+关键配套：`self._tasks: set[asyncio.Task]` 持有在跑的转发协程引用
+（`task.add_done_callback(self._tasks.discard)`），否则 asyncio 可能把未被引用的协程当
+垃圾回收，转发被中断。
+
+### 13.3 修复后效果
+- 每挡位**真实并发 = `Semaphore(N)`**，N 路同时转发受并发闸约束。
+- `/admin/queue/status` 的 `active` 能冲到并发数（修复前恒 ≤1），成为判断「多少请求同时在跑」的直观计数器。
+- 降级逻辑不变：降级只发生在 `_dispatch` 抢不到槽位的 `acquire` 超时这一步。
