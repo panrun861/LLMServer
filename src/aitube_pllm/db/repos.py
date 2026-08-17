@@ -7,7 +7,7 @@ import json
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Optional
 
 import asyncpg
 
@@ -476,23 +476,42 @@ class UsageRepo:
     @staticmethod
     async def get_usage_summary(
         conn: asyncpg.Connection,
-        pllm_token_id: uuid.UUID,
+        pllm_token_id: Optional[uuid.UUID],
         days: int,
     ) -> dict:
+        """按 token 维度或全局汇总用量。
+
+        pllm_token_id 为 None 时返回全局用量（用于 Ed25519 管理视角）；
+        传入具体 UUID 时按该 token 维度汇总（保持历史 Bearer 行为兼容）。
+        """
         since = _utcnow() - timedelta(days=days)
-        row = await conn.fetchrow(
-            """SELECT COUNT(*) as total_requests, COALESCE(SUM(total_tokens), 0) as total_tokens
-               FROM usage_logs WHERE pllm_token_id_snapshot = $1 AND created_at >= $2""",
-            pllm_token_id, since,
-        )
-        breakdown_rows = await conn.fetch(
-            """SELECT DATE(created_at) as date, model,
-                      COUNT(*) as requests, COALESCE(SUM(total_tokens), 0) as total_tokens
-               FROM usage_logs
-               WHERE pllm_token_id_snapshot = $1 AND created_at >= $2
-               GROUP BY DATE(created_at), model ORDER BY date""",
-            pllm_token_id, since,
-        )
+        if pllm_token_id is None:
+            row = await conn.fetchrow(
+                """SELECT COUNT(*) as total_requests, COALESCE(SUM(total_tokens), 0) as total_tokens
+                   FROM usage_logs WHERE created_at >= $1""",
+                since,
+            )
+            breakdown_rows = await conn.fetch(
+                """SELECT DATE(created_at) as date, model,
+                          COUNT(*) as requests, COALESCE(SUM(total_tokens), 0) as total_tokens
+                   FROM usage_logs WHERE created_at >= $1
+                   GROUP BY DATE(created_at), model ORDER BY date""",
+                since,
+            )
+        else:
+            row = await conn.fetchrow(
+                """SELECT COUNT(*) as total_requests, COALESCE(SUM(total_tokens), 0) as total_tokens
+                   FROM usage_logs WHERE pllm_token_id_snapshot = $1 AND created_at >= $2""",
+                pllm_token_id, since,
+            )
+            breakdown_rows = await conn.fetch(
+                """SELECT DATE(created_at) as date, model,
+                          COUNT(*) as requests, COALESCE(SUM(total_tokens), 0) as total_tokens
+                   FROM usage_logs
+                   WHERE pllm_token_id_snapshot = $1 AND created_at >= $2
+                   GROUP BY DATE(created_at), model ORDER BY date""",
+                pllm_token_id, since,
+            )
         return {
             "days": days,
             "total_requests": row["total_requests"] if row else 0,

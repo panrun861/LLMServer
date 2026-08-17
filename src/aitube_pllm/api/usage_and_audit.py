@@ -53,21 +53,24 @@ async def require_external_admin(request: Request) -> str:
 
 @router.get("/v1/usage")
 async def get_usage_summary(
+    request: Request,
     days: int = Query(7, ge=1, le=30),
-    token_record: dict = Depends(get_bearer_token),
+    pllm_token_id: Optional[uuid.UUID] = None,
+    admin_issuer: str = Depends(require_external_admin),
 ):
     """获取使用量统计
-    
+
     返回指定天数内的使用量统计，按日期和模型分组。
-    仅返回当前Token的使用量。
+    认证方式：Ed25519 签名（外部管理 API）。
+    不传 pllm_token_id 时返回全局用量汇总；传入则按该 token 维度汇总。
     """
     async with db.pool.acquire() as conn:
         summary = await UsageRepo.get_usage_summary(
             conn,
-            token_record["pllm_token_id"],
+            pllm_token_id,
             days,
         )
-    
+
     return summary
 
 
