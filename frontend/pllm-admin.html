@@ -94,9 +94,30 @@
   .modal .acts { display:flex; gap:8px; justify-content:flex-end; margin-top:18px; }
   .hint { font-size:11px; color:var(--muted); margin-top:4px; }
   code { background:#0c111c; padding:1px 6px; border-radius:5px; font-size:12px; }
+  /* 前端登录闸门：锁定态下隐藏除遮罩外的全部内容 */
+  #loginOverlay { position:fixed; inset:0; z-index:9999; background:var(--bg);
+    display:flex; align-items:center; justify-content:center; }
+  #loginOverlay .box { background:var(--card); border:1px solid var(--line); border-radius:14px;
+    padding:28px 30px; width:340px; box-shadow:0 10px 40px rgba(0,0,0,.5); }
+  #loginOverlay h2 { margin:0 0 4px; font-size:17px; }
+  #loginOverlay .sub { color:var(--muted); font-size:12px; margin-bottom:18px; }
+  #loginOverlay input { width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--line);
+    background:#0c111c; color:var(--txt); font-size:14px; margin-bottom:12px; box-sizing:border-box; }
+  #loginOverlay button { width:100%; }
+  #loginOverlay .err { color:var(--bad); font-size:12px; min-height:16px; margin-top:6px; }
+  body[data-locked="1"] > *:not(#loginOverlay) { display:none !important; }
 </style>
 </head>
-<body>
+<body data-locked="1">
+<div id="loginOverlay">
+  <div class="box">
+    <h2>🔐 控制台登录</h2>
+    <div class="sub">请输入访问口令后进入管理控制台</div>
+    <input id="loginPwd" type="password" placeholder="访问口令" autocomplete="off" />
+    <button class="primary" id="loginBtn">进入</button>
+    <div class="err" id="loginErr"></div>
+  </div>
+</div>
 <header>
   <div>
     <h1>PLLM 管理控制台</h1>
@@ -440,6 +461,55 @@
 <script>
 "use strict";
 const LS = { base:"pllm_base", token:"pllm_token", dtoken:"pllm_dtoken" };
+
+/* ===== 前端登录闸门：纯前端 SHA-256 比对，仅防误开，非真安全 ===== */
+function sha256(ascii){
+  function ro(v,a){ return (v>>>a)|(v<<(32-a)); }
+  var pow=Math.pow, max=pow(2,32), L="length", i, j, result="", words=[], bitLen=ascii[L]*8;
+  var hash=sha256.h||[], k=sha256.k||[], pc=k[L], comp={};
+  for(var c=2; pc<64; c++){ if(!comp[c]){ for(i=0;i<313;i+=c) comp[i]=c; hash[pc]=(pow(c,.5)*max)|0; k[pc++]=(pow(c,1/3)*max)|0; } }
+  ascii+="\x80";
+  while(ascii[L]%64-56) ascii+="\x00";
+  for(i=0;i<ascii[L];i++){ j=ascii.charCodeAt(i); if(j>>8) return; words[i>>2]|=j<<((3-i)%4)*8; }
+  words[words[L]]=((bitLen/max)|0); words[words[L]]=(bitLen);
+  for(j=0;j<words[L];){
+    var w=words.slice(j,j+=16), oh=hash, h=hash.slice(0,8);
+    for(i=0;i<64;i++){
+      var w15=w[i-15], w2=w[i-2], a=h[0], e=h[4];
+      var t1=h[7]+(ro(e,6)^ro(e,11)^ro(e,25))+((e&h[5])^((~e)&h[6]))+k[i]+(w[i]=(i<16)?w[i]:(w[i-16]+(ro(w15,7)^ro(w15,18)^(w15>>>3))+w[i-7]+(ro(w2,17)^ro(w2,19)^(w2>>>10)))|0);
+      var t2=(ro(a,2)^ro(a,13)^ro(a,22))+((a&h[1])^(a&h[2])^(h[1]&h[2]));
+      h=[(t1+t2)|0].concat(h); h[4]=(h[4]+t1)|0;
+    }
+    for(i=0;i<8;i++) h[i]=(h[i]+oh[i])|0;
+  }
+  for(i=0;i<8;i++) for(j=3;j+1;j--){ var b=(h[i]>>(j*8))&255; result+=((b<16)?"0":"")+b.toString(16); }
+  return result;
+}
+const LOGIN_HASH = "a8bf86f368f4fa9beb127e9ac8558850315a232802f803c1465d4338b22f7e82"; // SHA-256("seikoist")
+function tryUnlock(pwd){
+  if (sha256(pwd) === LOGIN_HASH){
+    sessionStorage.setItem("pllm_unlocked","1");
+    const ov=document.getElementById("loginOverlay"); if(ov) ov.remove();
+    document.body.removeAttribute("data-locked");
+    return true;
+  }
+  return false;
+}
+function initLogin(){
+  if (sessionStorage.getItem("pllm_unlocked") === "1"){
+    const ov=document.getElementById("loginOverlay"); if(ov) ov.remove();
+    document.body.removeAttribute("data-locked");
+    return;
+  }
+  document.body.setAttribute("data-locked","1");
+  const btn=document.getElementById("loginBtn");
+  const input=document.getElementById("loginPwd");
+  const err=document.getElementById("loginErr");
+  const submit=()=>{ err.textContent=""; if(!tryUnlock(input.value)){ err.textContent="口令错误，请重试"; input.value=""; input.focus(); } };
+  btn.onclick=submit;
+  input.addEventListener("keydown",e=>{ if(e.key==="Enter") submit(); });
+  setTimeout(()=>input.focus(),50);
+}
 const DEFAULT_DTOKEN = "pllm_dash_sTq2jdQERFiZF9PWZgVIMxCenXW6jiCI"; // 内网默认仪表盘令牌，可在配置里覆盖
 function cfg(){
   return {
@@ -1183,6 +1253,7 @@ $("issueSave").onclick = async ()=>{
 // ---------- init ----------
 loadCfgInputs();
 refreshStatus();
+initLogin();
 </script>
 </body>
 </html>
