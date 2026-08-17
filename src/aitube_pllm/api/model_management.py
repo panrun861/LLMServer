@@ -1,4 +1,4 @@
-"""模型登记管理 API - 仅 localhost CLI 可用"""
+"""模型登记管理 API - 需 Ed25519 签名认证（原 x-local-admin 已移除）"""
 
 import json
 from typing import Literal, Optional
@@ -16,14 +16,19 @@ from ..core.queue import queue_router
 router = APIRouter(prefix="/admin/models", tags=["Model Management"])
 
 
-def _require_local_admin(request: Request):
-    """验证 localhost CLI 认证"""
-    local_admin = request.headers.get("x-local-admin")
-    if local_admin != "true":
+def _require_external_admin(request: Request) -> str:
+    """要求 Ed25519 签名认证（由签名验证中间件注入 issuer_id）。
+
+    取代原 x-local-admin 弱鉴权：模型管理接口现在必须通过 Ed25519 签名，
+    issuer_id 由中间件在验签通过后写入 request.state。
+    """
+    issuer_id = getattr(request.state, "issuer_id", None)
+    if not issuer_id:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This endpoint is only available from localhost CLI",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Ed25519 signature authentication required",
         )
+    return issuer_id
 
 
 def _extract_upstream_type(runtime_params) -> Optional[str]:
@@ -133,7 +138,7 @@ async def register_model(body: ModelRegisterRequest, request: Request):
     - local_vllm（默认）：同一或多台 vLLM 节点，各配不同 api_base，api_key 可选
     - external_api：第三方 API，api_base + api_key 必填，key 存储前 AES 加密
     """
-    _require_local_admin(request)
+    _require_external_admin(request)
 
     # 外部 API 必填字段校验
     if body.upstream_type == "external_api":
@@ -229,7 +234,7 @@ async def sync_models(request: Request):
     - 上游不存在的已登记模型 -> sync_status='failed'，并按配置置 is_enabled=False
     - 若上游整体不可达，返回 502，不做批量禁用
     """
-    _require_local_admin(request)
+    _require_external_admin(request)
 
     try:
         result = await sync_models_from_upstream()
@@ -267,7 +272,7 @@ async def list_models(
     tier: Optional[str] = None,
 ):
     """列出所有登记的模型 (localhost CLI only)"""
-    _require_local_admin(request)
+    _require_external_admin(request)
 
     async with db.pool.acquire() as conn:
         models = await ModelRepo.list_all(conn, model_name=model_name, tier=tier)
@@ -296,7 +301,7 @@ async def list_models(
 @router.get("/{model_name}/tiers")
 async def list_tiers(model_name: str, request: Request):
     """列出指定模型的所有 tier"""
-    _require_local_admin(request)
+    _require_external_admin(request)
 
     async with db.pool.acquire() as conn:
         tiers = await ModelRepo.list_tiers(conn, model_name)
@@ -325,7 +330,7 @@ async def list_tiers(model_name: str, request: Request):
 @router.patch("/{model_name}/tiers/{tier}")
 async def update_model(model_name: str, tier: str, body: ModelUpdateRequest, request: Request):
     """更新模型配置"""
-    _require_local_admin(request)
+    _require_external_admin(request)
 
     async with db.pool.acquire() as conn:
         model = await ModelRepo.get_by_name_and_tier(conn, model_name, tier)
@@ -422,7 +427,7 @@ async def update_model(model_name: str, tier: str, body: ModelUpdateRequest, req
 @router.delete("/{model_name}/tiers/{tier}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_model(model_name: str, tier: str, request: Request):
     """删除模型登记 (不能删除 current tier)"""
-    _require_local_admin(request)
+    _require_external_admin(request)
 
     async with db.pool.acquire() as conn:
         model = await ModelRepo.get_by_name_and_tier(conn, model_name, tier)
@@ -456,7 +461,7 @@ async def delete_model(model_name: str, tier: str, request: Request):
 @router.put("/{model_name}/active-tier")
 async def activate_tier(model_name: str, body: TierActivateRequest, request: Request):
     """激活指定 tier (用于拥塞降级或恢复)"""
-    _require_local_admin(request)
+    _require_external_admin(request)
 
     async with db.pool.acquire() as conn:
         target = await ModelRepo.get_by_name_and_tier(conn, model_name, body.tier)
@@ -502,7 +507,7 @@ async def unset_current_model(model_name: str, request: Request):
 
     用于：删除当前模型前先「取消当前」，或让网关退回按客户端 body.model 路由。
     """
-    _require_local_admin(request)
+    _require_external_admin(request)
 
     async with db.pool.acquire() as conn:
         cleared = await ModelRepo.unset_current(conn, model_name)

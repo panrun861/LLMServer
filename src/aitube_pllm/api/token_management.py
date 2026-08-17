@@ -13,13 +13,18 @@ from ..db import db, TokenRepo, AuditRepo, IssuerRepo
 router = APIRouter(prefix="/admin/pllm-tokens", tags=["Token Management"])
 
 
-def _is_local_admin(request: Request) -> bool:
-    """判断是否为本地管理台调用（x-local-admin 弱鉴权）。
+def _require_issuer(request: Request) -> str:
+    """要求 Ed25519 签名认证，返回签名者 issuer_id（由中间件注入）。
 
-    该模式下绕过 Ed25519 签名的 issuer 隔离，供内网管理台查看/管理全部 token；
-    真实签名请求语义不受影响。
+    取代原 x-local-admin 弱鉴权：token / issuer 管理接口必须通过 Ed25519 签名。
     """
-    return request.headers.get("x-local-admin") == "true"
+    issuer_id = getattr(request.state, "issuer_id", None)
+    if not issuer_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Ed25519 signature authentication required",
+        )
+    return issuer_id
 
 
 class TokenIssueRequest(BaseModel):
@@ -51,11 +56,10 @@ async def issue_token(request: Request, body: TokenIssueRequest):
     
     每次调用都会生成新的 Token（非幂等），使用新的 nonce 防止重放。
     """
-    is_admin = _is_local_admin(request)
-    issuer_id = request.state.issuer_id if not is_admin else body.issuer_id
+    issuer_id = _require_issuer(request)
 
-    # 验证 issuer_id 与签名头一致（本地管理模式直接用 body.issuer_id）
-    if not is_admin and body.issuer_id != issuer_id:
+    # issuer_id 必须与签名头一致
+    if body.issuer_id != issuer_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="issuer_id in body must match X-Issuer-Id header",
@@ -115,8 +119,7 @@ async def revoke_tokens(request: Request, body: TokenRevokeRequest):
     
     可以通过 pllm_token_id 吊销单个，或通过 issuer_id + subject_id 吊销所有。
     """
-    is_admin = _is_local_admin(request)
-    issuer_id = request.state.issuer_id if not is_admin else None
+    issuer_id = _require_issuer(request)
 
     # 必须指定一种吊销方式
     if body.pllm_token_id and (body.issuer_id or body.subject_id):
@@ -141,8 +144,8 @@ async def revoke_tokens(request: Request, body: TokenRevokeRequest):
                     detail=f"Token not found: {body.pllm_token_id}",
                 )
             
-            # 验证权限：只能吊销自己签发的 Token（本地管理模式可吊销任意）
-            if not is_admin and token["issuer_id"] != issuer_id:
+            # 验证权限：只能吊销自己签发的 Token
+            if token["issuer_id"] != issuer_id:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Cannot revoke tokens issued by other issuers",
@@ -151,8 +154,8 @@ async def revoke_tokens(request: Request, body: TokenRevokeRequest):
             revoked = await TokenRepo.revoke_by_id(conn, body.pllm_token_id)
             action_detail = {"pllm_token_id": str(body.pllm_token_id)}
         else:
-            # 吊销指定 subject 的所有 Token（本地管理模式不受限）
-            if not is_admin and body.issuer_id != issuer_id:
+            # 吊销指定 subject 的所有 Token（仅限自己签发的）
+            if body.issuer_id != issuer_id:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Cannot revoke tokens for other issuers",
@@ -195,17 +198,16 @@ async def query_tokens(
     
     返回 Token 列表（包含已吊销的），但不返回明文。
     """
-    request_issuer_id = request.state.issuer_id if not _is_local_admin(request) else None
+    request_issuer_id = _require_issuer(request)
 
-    # 非本地管理模式：只能查询自己签发的 Token
-    if not _is_local_admin(request):
-        if issuer_id and issuer_id != request_issuer_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Cannot query tokens for other issuers",
-            )
-        if not issuer_id:
-            issuer_id = request_issuer_id
+    # 只能查询自己签发的 Token
+    if issuer_id and issuer_id != request_issuer_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot query tokens for other issuers",
+        )
+    if not issuer_id:
+        issuer_id = request_issuer_id
     
     if page_size > 100:
         page_size = 100
@@ -251,8 +253,7 @@ async def update_token_budget(
     body: TokenBudgetUpdateRequest,
 ):
     """更新 Token 预算"""
-    is_admin = _is_local_admin(request)
-    issuer_id = request.state.issuer_id if not is_admin else None
+    issuer_id = _require_issuer(request)
 
     # 至少需要指定一个字段
     if body.token_budget is None and body.token_budget_period is None:
@@ -277,7 +278,7 @@ async def update_token_budget(
                 detail=f"Token not found: {pllm_token_id}",
             )
         
-        if not is_admin and token["issuer_id"] != issuer_id:
+        if token["issuer_id"] != issuer_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Cannot update tokens issued by other issuers",
@@ -324,8 +325,9 @@ async def list_issuers(request: Request):
     """查询已注册签发者（公钥指纹）。
 
     仅暴露公钥前缀与 SHA256 指纹用于核对，不返回完整公钥明文。
-    x-local-admin 放行，供内网管理台查看已注册的 Ed25519 签发者。
+    需 Ed25519 签名认证。
     """
+    _require_issuer(request)
     async with db.pool.acquire() as conn:
         rows = await IssuerRepo.list_all(conn)
     items = []
@@ -358,14 +360,10 @@ class IssuerCreateRequest(BaseModel):
 async def create_issuer(request: Request, body: IssuerCreateRequest):
     """注册新的 Ed25519 签发者公钥。
 
-    需 x-local-admin 头（与 /admin/pllm-tokens 同源的本地管理逃生口）。
-    generate 模式返回的 private_key_seed 是签名私钥，服务端不存储，请立即保存。
+    需 Ed25519 签名认证。generate 模式返回的 private_key_seed 是签名私钥，
+    服务端不存储，请立即保存。
     """
-    if not _is_local_admin(request):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="x-local-admin header required to manage issuers",
-        )
+    admin_issuer = _require_issuer(request)
 
     async with db.pool.acquire() as conn:
         if await IssuerRepo.exists(conn, body.issuer_id):
@@ -394,7 +392,7 @@ async def create_issuer(request: Request, body: IssuerCreateRequest):
 
         await IssuerRepo.upsert(conn, body.issuer_id, body.key_id, public_key_hex)
         await AuditRepo.record_event(
-            conn, actor_type="local_admin", actor_id="x-local-admin",
+            conn, actor_type="issuer", actor_id=admin_issuer,
             action="create_issuer", target_type="issuer", target_id=body.issuer_id,
             result="success", detail={"key_id": body.key_id, "mode": mode, "force": body.force},
         )
@@ -417,17 +415,16 @@ async def revoke_issuer(request: Request, issuer_id: str):
     """吊销（停用）指定签发者。
 
     吊销后该 issuer 的 Ed25519 签名失效（is_active=FALSE），但已签发的 Bearer token 不受影响。
-    需 x-local-admin 头。
+    需 Ed25519 签名认证。
     """
-    if not _is_local_admin(request):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="x-local-admin header required to manage issuers")
+    admin_issuer = _require_issuer(request)
 
     async with db.pool.acquire() as conn:
         n = await IssuerRepo.deactivate(conn, issuer_id)
         if n == 0:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"issuer_id '{issuer_id}' not found")
         await AuditRepo.record_event(
-            conn, actor_type="local_admin", actor_id="x-local-admin",
+            conn, actor_type="issuer", actor_id=admin_issuer,
             action="revoke_issuer", target_type="issuer", target_id=issuer_id,
             result="success", detail={},
         )
@@ -450,10 +447,9 @@ class IssuerVerifyRequest(BaseModel):
 async def verify_issuer(request: Request, body: IssuerVerifyRequest):
     """校验 Ed25519 密钥：私钥自洽 + 与已登记公钥一致 + 是否已 active。
 
-    需 x-local-admin 头。用于前端「校验签名」工具，确认密钥对可用来调用管理 API。
+    需 Ed25519 签名认证。用于前端「校验签名」工具，确认密钥对可用来调用管理 API。
     """
-    if not _is_local_admin(request):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="x-local-admin header required to manage issuers")
+    _require_issuer(request)
 
     async with db.pool.acquire() as conn:
         row = await IssuerRepo.get_active(body.issuer_id, body.key_id, conn)

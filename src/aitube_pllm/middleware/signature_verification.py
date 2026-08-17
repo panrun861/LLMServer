@@ -34,12 +34,8 @@ class SignatureVerificationMiddleware(BaseHTTPMiddleware):
         if request.url.path.startswith("/admin/dashboard") or request.url.path.startswith("/admin/queue"):
             return await call_next(request)
 
-        # 跳过 localhost CLI 端点（模型管理 / token 管理使用 x-local-admin 认证）
-        if request.headers.get("x-local-admin") == "true" and (
-            request.url.path.startswith("/admin/models")
-            or request.url.path.startswith("/admin/pllm-tokens")
-        ):
-            return await call_next(request)
+        # 其余 /admin/* 接口（含 /admin/models、/admin/pllm-tokens）统一走 Ed25519 签名验证。
+        # 原 x-local-admin 弱鉴权已移除：不再对任何路径按固定请求头放行。
 
         try:
             return await self._verify(request, call_next)
