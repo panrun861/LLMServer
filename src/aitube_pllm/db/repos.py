@@ -58,6 +58,28 @@ class IssuerRepo:
         )
         return [dict(r) for r in rows]
 
+    @staticmethod
+    async def exists(conn: asyncpg.Connection, issuer_id: str) -> bool:
+        """判断 issuer_id 是否已注册（无论 active 与否）。"""
+        row = await conn.fetchval(
+            "SELECT 1 FROM issuers WHERE issuer_id = $1", issuer_id
+        )
+        return row is not None
+
+    @staticmethod
+    async def deactivate(conn: asyncpg.Connection, issuer_id: str) -> int:
+        """吊销（停用）指定签发者，保留历史记录。
+
+        吊销后该 issuer 的 Ed25519 签名将不再通过 get_active 校验（is_active=FALSE），
+        但已签发的 Bearer token 不受影响（token 校验不依赖 issuer 的 is_active）。
+        返回受影响的行数（0 表示 issuer_id 不存在）。
+        """
+        result = await conn.execute(
+            "UPDATE issuers SET is_active = FALSE WHERE issuer_id = $1",
+            issuer_id,
+        )
+        return int(result.split()[-1]) if result else 0
+
 
 class NonceRepo:
     """Nonce 仓库"""

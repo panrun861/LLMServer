@@ -340,3 +340,156 @@ async def list_issuers(request: Request):
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
         })
     return {"items": items, "total": len(items)}
+
+
+class IssuerCreateRequest(BaseModel):
+    """注册 Ed25519 签发者（用于管理 API 签名）
+
+    - public_key 不传：由服务端生成 Ed25519 密钥对，返回私钥 seed（仅此一次），公钥入库。
+    - public_key 传入：导入用户自带公钥（32 字节 hex），服务端只存公钥。
+    """
+    issuer_id: str = Field(..., max_length=64, description="签发者唯一标识")
+    key_id: str = Field(..., max_length=128, description="密钥标识（同一 issuer 下的 key 版本号）")
+    public_key: Optional[str] = Field(None, description="可选。Ed25519 公钥 32 字节 hex；不传则服务端生成")
+    force: bool = Field(False, description="issuer_id 已存在时是否覆盖公钥（轮换 key 用）")
+
+
+@router.post("/issuers", status_code=status.HTTP_201_CREATED)
+async def create_issuer(request: Request, body: IssuerCreateRequest):
+    """注册新的 Ed25519 签发者公钥。
+
+    需 x-local-admin 头（与 /admin/pllm-tokens 同源的本地管理逃生口）。
+    generate 模式返回的 private_key_seed 是签名私钥，服务端不存储，请立即保存。
+    """
+    if not _is_local_admin(request):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="x-local-admin header required to manage issuers",
+        )
+
+    async with db.pool.acquire() as conn:
+        if await IssuerRepo.exists(conn, body.issuer_id):
+            if not body.force:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"issuer_id '{body.issuer_id}' already exists; use force=true to rotate key",
+                )
+
+        if body.public_key:
+            try:
+                raw = bytes.fromhex(body.public_key)
+            except ValueError:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="public_key must be hex-encoded")
+            if len(raw) != 32:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="public_key must be 32 bytes (64 hex chars)")
+            public_key_hex = body.public_key
+            private_key_seed = None
+            mode = "import"
+        else:
+            from nacl.signing import SigningKey
+            signing_key = SigningKey.generate()
+            public_key_hex = signing_key.verify_key.encode().hex()
+            private_key_seed = signing_key.encode().hex()
+            mode = "generate"
+
+        await IssuerRepo.upsert(conn, body.issuer_id, body.key_id, public_key_hex)
+        await AuditRepo.record_event(
+            conn, actor_type="local_admin", actor_id="x-local-admin",
+            action="create_issuer", target_type="issuer", target_id=body.issuer_id,
+            result="success", detail={"key_id": body.key_id, "mode": mode, "force": body.force},
+        )
+
+    resp = {
+        "issuer_id": body.issuer_id,
+        "key_id": body.key_id,
+        "mode": mode,
+        "public_key_fingerprint": hashlib.sha256(public_key_hex.encode()).hexdigest()[:16],
+    }
+    if mode == "generate":
+        resp["public_key"] = public_key_hex
+        resp["private_key_seed"] = private_key_seed
+        resp["warning"] = "private_key_seed 是签名私钥，服务端不存储，请立即妥善保存"
+    return resp
+
+
+@router.delete("/issuers/{issuer_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_issuer(request: Request, issuer_id: str):
+    """吊销（停用）指定签发者。
+
+    吊销后该 issuer 的 Ed25519 签名失效（is_active=FALSE），但已签发的 Bearer token 不受影响。
+    需 x-local-admin 头。
+    """
+    if not _is_local_admin(request):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="x-local-admin header required to manage issuers")
+
+    async with db.pool.acquire() as conn:
+        n = await IssuerRepo.deactivate(conn, issuer_id)
+        if n == 0:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"issuer_id '{issuer_id}' not found")
+        await AuditRepo.record_event(
+            conn, actor_type="local_admin", actor_id="x-local-admin",
+            action="revoke_issuer", target_type="issuer", target_id=issuer_id,
+            result="success", detail={},
+        )
+
+
+class IssuerVerifyRequest(BaseModel):
+    """校验 Ed25519 密钥对是否可用且已登记。
+
+    - private_key_seed：generate 模式返回的私钥 seed（hex）。后端派生公钥并做一次自洽签名验签，
+      同时比对 issuers 表中已登记的公钥是否一致。
+    - public_key：也可只给公钥，核对是否已登记且 active。
+    """
+    issuer_id: str = Field(..., max_length=64)
+    key_id: str = Field(..., max_length=128)
+    private_key_seed: Optional[str] = Field(None, description="Ed25519 私钥 seed（hex），generate 模式返回的值")
+    public_key: Optional[str] = Field(None, description="或仅提供公钥（hex）核对登记状态")
+
+
+@router.post("/issuers/verify")
+async def verify_issuer(request: Request, body: IssuerVerifyRequest):
+    """校验 Ed25519 密钥：私钥自洽 + 与已登记公钥一致 + 是否已 active。
+
+    需 x-local-admin 头。用于前端「校验签名」工具，确认密钥对可用来调用管理 API。
+    """
+    if not _is_local_admin(request):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="x-local-admin header required to manage issuers")
+
+    async with db.pool.acquire() as conn:
+        row = await IssuerRepo.get_active(body.issuer_id, body.key_id, conn)
+        if not row:
+            return {"registered": False, "active": False, "detail": "issuer/key 不存在或已停用"}
+
+        stored_pk = row["public_key"]
+        if body.private_key_seed:
+            try:
+                from nacl.signing import SigningKey
+                sk = SigningKey(bytes.fromhex(body.private_key_seed))
+                derived_pk = sk.verify_key.encode().hex()
+            except Exception:
+                return {"registered": True, "active": row["is_active"], "private_key_valid": False,
+                        "detail": "private_key_seed 非合法 hex 或长度不对"}
+            # 自洽验签：用私钥签名，再用派生公钥验签
+            try:
+                msg = b"pllm-ed25519-verify"
+                sig = sk.sign(msg)
+                sk.verify_key.verify(sig)
+                sig_ok = True
+            except Exception:
+                sig_ok = False
+            return {
+                "registered": True,
+                "active": row["is_active"],
+                "private_key_valid": True,
+                "signature_self_check": sig_ok,
+                "public_key_matches_registered": (derived_pk == stored_pk),
+                "derived_public_key": derived_pk,
+            }
+        if body.public_key:
+            return {
+                "registered": True,
+                "active": row["is_active"],
+                "public_key_matches_registered": (body.public_key == stored_pk),
+            }
+        return {"registered": True, "active": row["is_active"],
+                "detail": "请提供 private_key_seed 或 public_key 以完成校验"}

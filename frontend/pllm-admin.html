@@ -242,8 +242,38 @@
       </div>
       <div class="panel">
         <h2>签发 Key（Ed25519 签发者）</h2>
+        <div class="cfg-actions">
+          <button class="primary" id="issuerRefresh">刷新</button>
+          <button class="primary" id="issuerAddBtn">添加签发者</button>
+          <span id="issuerMsg" class="meta"></span>
+        </div>
         <div id="issuerErr" class="err"></div>
         <div class="scroll"><table id="issuerTable"></table></div>
+
+        <h2 style="margin-top:18px;">校验签名（确认密钥对可用且已登记）</h2>
+        <div class="grid2" style="grid-template-columns:1fr 1fr; gap:12px;">
+          <div class="field">
+            <label>issuer_id（需与已登记一致）</label>
+            <input id="verifyIssuer" type="text" placeholder="例如 my-cli" />
+          </div>
+          <div class="field">
+            <label>key_id（需与已登记一致）</label>
+            <input id="verifyKeyId" type="text" placeholder="例如 key-2026" />
+          </div>
+          <div class="field">
+            <label>私钥 seed（hex，generate 返回；可选）</label>
+            <input id="verifyPriv" type="text" placeholder="64 hex（留空则只用公钥核对）" />
+          </div>
+          <div class="field">
+            <label>公钥（hex，可选，仅核对登记状态）</label>
+            <input id="verifyPub" type="text" placeholder="64 hex（可选）" />
+          </div>
+        </div>
+        <div class="cfg-actions" style="margin-top:10px;">
+          <button id="verifyBtn">校验</button>
+          <span id="verifyMsg" class="meta"></span>
+        </div>
+        <div id="verifyResult" class="ok-msg"></div>
       </div>
     </section>
 
@@ -336,6 +366,28 @@
     <div class="acts">
       <button id="issueCancel">取消</button>
       <button class="primary" id="issueSave">签发</button>
+    </div>
+  </div>
+</div>
+
+<!-- 添加签发者弹窗 -->
+<div class="modal-bg" id="issuerAddModal">
+  <div class="modal">
+    <h3>添加 Ed25519 签发者</h3>
+    <label>issuer_id（必填，唯一标识）</label>
+    <input id="addIssuerId" type="text" placeholder="例如 my-cli / panr" />
+    <label>key_id（必填，密钥版本）</label>
+    <input id="addKeyId" type="text" placeholder="例如 key-2026" />
+    <label>public_key（可选，自带公钥 64 hex；留空 = 服务端生成密钥对）</label>
+    <input id="addPub" type="text" placeholder="留空则由服务端生成，并返回私钥供你保存" />
+    <label style="display:flex; align-items:center; gap:8px; margin-top:12px;">
+      <input type="checkbox" id="addForce" style="width:auto;" /> issuer_id 已存在时强制覆盖（轮换 key）
+    </label>
+    <div id="addErr" class="err"></div>
+    <div id="addResult" class="ok-msg"></div>
+    <div class="acts">
+      <button id="addIssuerCancel">取消</button>
+      <button class="primary" id="addIssuerSave">添加</button>
     </div>
   </div>
 </div>
@@ -1014,9 +1066,10 @@ function renderTokenTable(items){
 }
 function renderIssuerTable(items){
   if(!items.length){ $("issuerTable").innerHTML = `<tr><td class="meta">暂无签发者</td></tr>`; return; }
-  let html = `<tr><th>Issuer ID</th><th>Key ID</th><th>状态</th><th>公钥前缀</th><th>指纹(SHA256前16)</th><th>注册时间</th></tr>`;
+  let html = `<tr><th>Issuer ID</th><th>Key ID</th><th>状态</th><th>公钥前缀</th><th>指纹(SHA256前16)</th><th>注册时间</th><th>操作</th></tr>`;
   items.forEach(r=>{
     const act = r.is_active ? '<span class="tag ok">启用</span>' : '<span class="tag bad">停用</span>';
+    const op = r.is_active ? `<button class="danger" data-revoke-issuer="${esc(r.issuer_id)}">吊销</button>` : "";
     html += `<tr>
       <td>${esc(r.issuer_id)}</td>
       <td>${esc(r.key_id)}</td>
@@ -1024,9 +1077,13 @@ function renderIssuerTable(items){
       <td class="wrap2">${esc(r.public_key_prefix||"–")}</td>
       <td class="wrap2">${esc(r.public_key_fingerprint||"–")}</td>
       <td>${esc((r.created_at||"").replace("T"," "))}</td>
+      <td>${op}</td>
     </tr>`;
   });
   $("issuerTable").innerHTML = html;
+  $("issuerTable").querySelectorAll("button[data-revoke-issuer]").forEach(b=>{
+    b.onclick = ()=> revokeIssuer(b.dataset.revokeIssuer);
+  });
 }
 async function revokeToken(id){
   if(!confirm("确认吊销 Token "+id+"？吊销后该 Token 立即失效，不可恢复。")) return;
@@ -1038,6 +1095,67 @@ async function revokeToken(id){
   } catch(e){ $("keysErr").textContent = "吊销失败: " + e.message; }
 }
 $("keysRefresh").onclick = refreshKeys;
+
+// ---- 签发者管理（Ed25519 添加 / 吊销 / 校验）----
+$("issuerRefresh").onclick = refreshKeys;
+$("issuerAddBtn").onclick = ()=> $("issuerAddModal").classList.add("show");
+$("addIssuerCancel").onclick = ()=> $("issuerAddModal").classList.remove("show");
+$("addIssuerSave").onclick = async ()=>{
+  $("addErr").textContent = ""; $("addResult").textContent = "";
+  const issuer = $("addIssuerId").value.trim();
+  const keyId = $("addKeyId").value.trim();
+  if(!issuer){ $("addErr").textContent = "issuer_id 必填"; return; }
+  if(!keyId){ $("addErr").textContent = "key_id 必填"; return; }
+  const pub = $("addPub").value.trim();
+  if(pub && !/^[0-9a-fA-F]{64}$/.test(pub)){ $("addErr").textContent = "public_key 必须为 64 hex（32 字节）"; return; }
+  const body = { issuer_id: issuer, key_id: keyId, public_key: pub || null, force: $("addForce").checked };
+  try {
+    const r = await api("/admin/pllm-tokens/issuers", {method:"POST", auth:"admin", body});
+    if (r.mode === "generate"){
+      $("addResult").innerHTML =
+        `已添加（服务端生成）✓ 公钥指纹：${esc(r.public_key_fingerprint)}<br>` +
+        `<b>私钥 seed（仅显示一次，立即保存！）</b>：<br><code>${esc(r.private_key_seed)}</code><br>` +
+        `<span class="hint">用此私钥对 /admin/* 请求做 Ed25519 签名即可调用管理 API。</span>`;
+    } else {
+      $("addResult").innerHTML = `已添加（导入公钥）✓ 公钥指纹：${esc(r.public_key_fingerprint)}`;
+    }
+    $("issuerAddModal").querySelectorAll("input").forEach(i=>{ if(i.type!=="checkbox") i.value=""; });
+    await refreshKeys();
+  } catch(e){ $("addErr").textContent = "添加失败: " + e.message; }
+};
+
+async function revokeIssuer(issuerId){
+  if(!confirm("确认吊销签发者 "+issuerId+"？吊销后该签发者的 Ed25519 签名立即失效（已签发的 Bearer token 不受影响）。")) return;
+  $("issuerMsg").textContent = "吊销中…";
+  try {
+    await api("/admin/pllm-tokens/issuers/"+encodeURIComponent(issuerId), {method:"DELETE", auth:"admin"});
+    $("issuerMsg").textContent = "已吊销 ✓";
+    await refreshKeys();
+  } catch(e){ $("issuerErr").textContent = "吊销失败: " + e.message; }
+}
+
+$("verifyBtn").onclick = async ()=>{
+  $("verifyMsg").textContent = "校验中…"; $("verifyResult").textContent = "";
+  const issuer = $("verifyIssuer").value.trim();
+  const keyId = $("verifyKeyId").value.trim();
+  const priv = $("verifyPriv").value.trim();
+  const pub = $("verifyPub").value.trim();
+  if(!issuer || !keyId){ $("verifyMsg").textContent = "issuer_id 与 key_id 必填"; return; }
+  const body = { issuer_id: issuer, key_id: keyId, private_key_seed: priv || null, public_key: pub || null };
+  try {
+    const r = await api("/admin/pllm-tokens/issuers/verify", {method:"POST", auth:"admin", body});
+    if (!r.registered){ $("verifyResult").innerHTML = `<span style="color:var(--bad)">未登记或已停用</span> — ${esc(r.detail||"")}`; $("verifyMsg").textContent=""; return; }
+    const lines = [];
+    lines.push(`已登记：<b style="color:var(--ok)">是</b>`);
+    lines.push(`状态：${r.active ? '<span class="tag ok">启用</span>' : '<span class="tag bad">停用</span>'}`);
+    if (r.private_key_valid !== undefined) lines.push(`私钥合法：<b>${r.private_key_valid?"是":"否"}</b>`);
+    if (r.signature_self_check !== undefined) lines.push(`自洽验签：<b style="color:${r.signature_self_check?'var(--ok)':'var(--bad)'}">${r.signature_self_check?"通过":"失败"}</b>`);
+    if (r.public_key_matches_registered !== undefined) lines.push(`公钥与已登记一致：<b style="color:${r.public_key_matches_registered?'var(--ok)':'var(--bad)'}">${r.public_key_matches_registered?"是":"否"}</b>`);
+    if (r.derived_public_key) lines.push(`派生公钥：${esc(r.derived_public_key)}`);
+    $("verifyResult").innerHTML = lines.join(" · ");
+    $("verifyMsg").textContent = "校验完成";
+  } catch(e){ $("verifyMsg").textContent = "校验失败: " + e.message; }
+};
 $("keysIssueBtn").onclick = ()=> $("issueModal").classList.add("show");
 $("issueCancel").onclick = ()=> $("issueModal").classList.remove("show");
 $("issueSave").onclick = async ()=>{
