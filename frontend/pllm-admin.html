@@ -488,14 +488,14 @@ function sha256(ascii){
   for(i=0;i<ascii[L];i++){ j=ascii.charCodeAt(i); if(j>>8) return; words[i>>2]|=j<<((3-i)%4)*8; }
   words[words[L]]=((bitLen/max)|0); words[words[L]]=(bitLen);
   for(j=0;j<words[L];){
-    var w=words.slice(j,j+=16), oh=hash, h=hash.slice(0,8);
+    var w=words.slice(j,j+=16), oh=hash.slice(0,8), h=oh.slice();
     for(i=0;i<64;i++){
       var w15=w[i-15], w2=w[i-2], a=h[0], e=h[4];
       var t1=h[7]+(ro(e,6)^ro(e,11)^ro(e,25))+((e&h[5])^((~e)&h[6]))+k[i]+(w[i]=(i<16)?w[i]:(w[i-16]+(ro(w15,7)^ro(w15,18)^(w15>>>3))+w[i-7]+(ro(w2,17)^ro(w2,19)^(w2>>>10)))|0);
       var t2=(ro(a,2)^ro(a,13)^ro(a,22))+((a&h[1])^(a&h[2])^(h[1]&h[2]));
       h=[(t1+t2)|0].concat(h); h[4]=(h[4]+t1)|0;
     }
-    for(i=0;i<8;i++) h[i]=(h[i]+oh[i])|0;
+    for(i=0;i<8;i++) hash[i]=h[i]=(h[i]+oh[i])|0;
   }
   for(i=0;i<8;i++) for(j=3;j+1;j--){ var b=(h[i]>>(j*8))&255; result+=((b<16)?"0":"")+b.toString(16); }
   return result;
