@@ -571,12 +571,13 @@ function apiBase(){
   const v = (document.getElementById("cfgBase")?.value || "").trim();
   return (v || cfg().base).replace(/\/+$/,"");
 }
-async function derivedAdminPubFingerprint(seedHex){
+function derivedAdminPubFingerprint(seedHex){
   const seed = normalizeSeed(seedHex);
   const bytes = new Uint8Array(seed.match(/.{2}/g).map(h => parseInt(h, 16)));
   const kp = nacl.sign.keyPair.fromSeed(bytes);
   const pubHex = Array.from(kp.publicKey).map(b => b.toString(16).padStart(2, "0")).join("");
-  const fpFull = await sha256HexBytes(new TextEncoder().encode(pubHex));
+  // pubHex 为 ASCII；不用 crypto.subtle（HTTP 非 localhost 下不可用）
+  const fpFull = sha256(pubHex);
   return { pubHex, fingerprint: fpFull.slice(0, 16) };
 }
 
@@ -590,10 +591,6 @@ function utcTimestamp(){
   const p = (n) => String(n).padStart(2, "0");
   return d.getUTCFullYear() + "-" + p(d.getUTCMonth()+1) + "-" + p(d.getUTCDate())
     + "T" + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds()) + "+00:00";
-}
-async function sha256HexBytes(bytes){
-  const buf = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 function edSign(seedHex, msgBytes){
   const seed = new Uint8Array(seedHex.match(/.{2}/g).map(h => parseInt(h, 16)));
@@ -690,7 +687,7 @@ $("cfgTestAdmin").onclick = async ()=>{
   try {
     saveCfg();
     const ac = adminCfgFromForm();
-    const { fingerprint } = await derivedAdminPubFingerprint(normalizeSeed(ac.adminSeed));
+    const { fingerprint } = derivedAdminPubFingerprint(normalizeSeed(ac.adminSeed));
     await api("/admin/pllm-tokens/issuers", { auth: "admin" });
     $("cfgStatus").textContent =
       `Ed25519 验签通过 ✓ ${ac.adminIssuer}/${ac.adminKeyId} · 派生公钥指纹 ${fingerprint}（须与签发者列表一致）`;
