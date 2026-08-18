@@ -375,8 +375,9 @@
 <div class="modal-bg" id="issueModal">
   <div class="modal">
     <h3>签发新 Token</h3>
-    <label>issuer_id（必填，逻辑签发者标识）</label>
-    <input id="issueIssuer" type="text" placeholder="例如 admin 或 your-issuer" />
+    <label>issuer_id（必须与连接配置里的 Ed25519 签发者一致，由签名头决定）</label>
+    <input id="issueIssuer" type="text" readonly placeholder="打开时自动填入连接配置的签发者，如 local-test" />
+    <div class="hint">后端要求 body.issuer_id = X-Issuer-Id。当前用连接配置签名，因此这里不能填别人的 issuer。</div>
     <label>subject_id（可选）</label>
     <input id="issueSubject" type="text" placeholder="可选，主体标识" />
     <label>name（可选，备注）</label>
@@ -666,8 +667,8 @@ async function api(path, opts={}){
     if (String(msg).includes("Issuer not found or inactive")) {
       msg += "（x-key-id 必须与库里该 issuer 的 key_id 完全一致，local-test 应为 key-2026）";
     }
-    if (String(msg).includes("localhost CLI")) {
-      msg += "（签名已通过，但线上后端仍是旧版 x-local-admin 校验，需要部署最新代码）";
+    if (String(msg).includes("issuer_id in body must match")) {
+      msg += "（签发 Token 的 issuer_id 必须等于连接配置里的 Ed25519 签发者，例如 local-test）";
     }
     throw new Error(msg);
   }
@@ -1438,12 +1439,19 @@ $("verifyBtn").onclick = async ()=>{
     $("verifyMsg").textContent = "校验完成";
   } catch(e){ $("verifyMsg").textContent = "校验失败: " + e.message; }
 };
-$("keysIssueBtn").onclick = ()=> $("issueModal").classList.add("show");
+$("keysIssueBtn").onclick = ()=>{
+  const ac = adminCfgFromForm();
+  $("issueIssuer").value = ac.adminIssuer || "";
+  $("issueErr").textContent = ac.adminIssuer ? "" : "请先在连接配置填写 Ed25519 签发者并保存";
+  $("issueModal").classList.add("show");
+};
 $("issueCancel").onclick = ()=> $("issueModal").classList.remove("show");
 $("issueSave").onclick = async ()=>{
   $("issueErr").textContent = ""; $("issueResult").textContent = "";
-  const issuer = $("issueIssuer").value.trim();
-  if(!issuer){ $("issueErr").textContent = "issuer_id 必填"; return; }
+  const ac = adminCfgFromForm();
+  const issuer = (ac.adminIssuer || "").trim();
+  if(!issuer){ $("issueErr").textContent = "连接配置里的 Ed25519 签发者不能为空"; return; }
+  $("issueIssuer").value = issuer;
   const budget = $("issueBudget").value.trim();
   const period = $("issuePeriod").value;
   if(budget && !period){ $("issueErr").textContent = "填了预算必须选择周期(daily/monthly/total)"; return; }
