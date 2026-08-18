@@ -767,6 +767,34 @@ queue_router.forward_fn = _queue_forward
 
 
 # ---------------------------------------------------------------------------
+# /v1/models  —— Agent / 客户端发现可用模型（轻量只读，Bearer 认证）
+# ---------------------------------------------------------------------------
+@router.get("/models")
+async def list_models(token_record: dict = Depends(bearer_auth)):
+    """列出当前可用模型及上下文长度（OpenAI 兼容格式）。
+
+    只返回 is_enabled=TRUE 的模型，不暴露 api_base、api_key 等内部配置。
+    管理员完整列表请用 GET /admin/models（Ed25519 签名）。
+    """
+    async with db.pool.acquire() as conn:
+        rows = await ModelRepo.list_all(conn)
+
+    data = []
+    for m in rows:
+        if not m.get("is_enabled"):
+            continue
+        data.append({
+            "id": m["model_name"],
+            "object": "model",
+            "owned_by": "aitube-pllm",
+            "context_length": m["context_length"],
+            "tier": m["tier"],
+            "is_current": m["is_current"],
+        })
+    return {"object": "list", "data": data}
+
+
+# ---------------------------------------------------------------------------
 # /v1/usage
 # ---------------------------------------------------------------------------
 @router.get("/usage")
