@@ -155,13 +155,14 @@
       </div>
       <div class="field">
         <label>管理员私钥 seed（hex，Ed25519 签名）</label>
-        <input id="cfgAdminSeed" type="password" placeholder="对应私钥 64 hex，须与上面 issuer 成对" />
+        <input id="cfgAdminSeed" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" placeholder="64 hex 私钥 seed；local-test 应以 c1b66bda 开头" />
       </div>
     </div>
     <div class="cfg-actions">
       <button class="primary" id="cfgSave">保存配置</button>
       <button id="cfgTest">测试连接 (/health)</button>
       <button id="cfgTestAdmin">测试 Ed25519 签名</button>
+      <button id="cfgClearAdmin">清空 Ed25519 配置</button>
       <span id="cfgStatus" class="meta"></span>
     </div>
     <div class="hint">说明：模型/Token 管理用 Ed25519 签名。issuer_id、key_id、私钥必须是同一对（例如已登记的 local-test / key-2026）。填完务必点「保存配置」，否则会沿用旧值，出现 Signature verification failed。对话用 PLLM Token；系统资源用 Dashboard Token。</div>
@@ -554,6 +555,19 @@ function saveCfg(){
   const seedRaw = document.getElementById("cfgAdminSeed").value;
   localStorage.setItem(LS.adminSeed, String(seedRaw || "").replace(/\s+/g, "").toLowerCase());
 }
+function clearAdminCfg(){
+  localStorage.removeItem(LS.adminIssuer);
+  localStorage.removeItem(LS.adminKeyId);
+  localStorage.removeItem(LS.adminSeed);
+  document.getElementById("cfgAdminIssuer").value = "";
+  document.getElementById("cfgAdminKeyId").value = "";
+  document.getElementById("cfgAdminSeed").value = "";
+}
+function seedPrefixHint(seedHex){
+  const s = String(seedHex || "").replace(/\s+/g, "").toLowerCase();
+  if (!s) return "";
+  return " · seed 前8位 " + s.slice(0, 8) + (s.startsWith("c1b66bda") ? " ✓" : "（local-test 应为 c1b66bda）");
+}
 
 function adminCfgFromForm(){
   const issuer = (document.getElementById("cfgAdminIssuer")?.value || "").trim();
@@ -684,7 +698,16 @@ document.querySelectorAll("nav.tabs button").forEach(b=>{
   };
 });
 $("cfgToggle").onclick = ()=> $("config").classList.toggle("collapsed");
-$("cfgSave").onclick = ()=>{ saveCfg(); $("cfgStatus").textContent = "已保存 ✓"; setTimeout(()=>$("cfgStatus").textContent="",2000); };
+$("cfgSave").onclick = ()=>{
+  saveCfg();
+  $("cfgStatus").textContent = "已保存 ✓" + seedPrefixHint(localStorage.getItem(LS.adminSeed));
+  setTimeout(()=>$("cfgStatus").textContent="", 4000);
+};
+$("cfgClearAdmin").onclick = ()=>{
+  clearAdminCfg();
+  $("cfgStatus").textContent = "已清空 Ed25519 配置，请重新填写并保存";
+  setTimeout(()=>$("cfgStatus").textContent="", 4000);
+};
 $("cfgTest").onclick = async ()=>{
   $("cfgStatus").textContent = "测试中…";
   try { const r = await api("/health"); $("cfgStatus").textContent = "连接成功: " + (r&&r.status||"ok") + " ✓"; }
