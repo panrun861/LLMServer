@@ -598,16 +598,14 @@ function edSign(seedHex, msgBytes){
   const sig = nacl.sign.detached(msgBytes, kp.secretKey);
   return Array.from(sig).map(b => b.toString(16).padStart(2, '0')).join('');
 }
-async function signHeaders(method, path, bodyObj){
+async function signHeaders(method, path, bodyStr){
   const ac = adminCfgFromForm();
   if (!ac.adminIssuer || !ac.adminKeyId) throw new Error("未配置 Ed25519 签发者 / key_id（连接配置里填写并保存）");
   if (!ac.adminSeed) throw new Error("未配置管理员私钥 seed（连接配置里填写并保存）");
   const seed = normalizeSeed(ac.adminSeed);
   const timestamp = new Date().toISOString();
   const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b=>b.toString(16).padStart(2,'0')).join('');
-  const bodyStr = bodyObj ? JSON.stringify(bodyObj) : "";
-  // 与后端 hashlib.sha256(body) 对齐（UTF-8 字节）
-  const bodyHash = sha256(unescape(encodeURIComponent(bodyStr)));
+  const bodyHash = sha256Utf8(bodyStr || "");
   const content = method + "\n" + path + "\n" + SIGN_AUDIENCE + "\n" + timestamp + "\n" + nonce + "\n" + bodyHash;
   const sig = edSign(seed, new TextEncoder().encode(content));
   return {
@@ -620,21 +618,31 @@ async function signHeaders(method, path, bodyObj){
   };
 }
 
+function sha256Utf8(str){
+  const bytes = new TextEncoder().encode(String(str || ""));
+  let ascii = "";
+  for (let i = 0; i < bytes.length; i++) ascii += String.fromCharCode(bytes[i]);
+  return sha256(ascii);
+}
+
 async function api(path, opts={}){
   // 管理接口签名直接读表单；发起前同步 localStorage，避免「填了没点保存」
   if (opts.auth === "admin") saveCfg();
   const c = cfg();
   const base = apiBase();
   const method = opts.method || "GET";
+  const bodyStr = opts.body != null ? JSON.stringify(opts.body) : "";
   const headers = { "Content-Type":"application/json" };
-  if (opts.auth === "admin") Object.assign(headers, await signHeaders(method, path, opts.body));
+  if (opts.auth === "admin") Object.assign(headers, await signHeaders(method, path, bodyStr));
   else if (opts.auth === "bearer") headers["Authorization"] = "Bearer " + c.token;
   else if (opts.auth === "dash") headers["X-Dashboard-Token"] = c.dtoken;
-  const res = await fetch(base + path, {
+  const fetchOpts = {
     method,
     headers,
-    body: opts.body ? JSON.stringify(opts.body) : undefined
-  });
+    cache: opts.auth === "admin" ? "no-store" : "default",
+    body: bodyStr || undefined
+  };
+  const res = await fetch(base + path, fetchOpts);
   if (!res.ok){
     let msg = "HTTP " + res.status;
     try { const j = await res.json(); if (j && j.detail) msg = (Array.isArray(j.detail)? j.detail.map(x=>x.msg||x).join("; ") : j.detail); } catch(e){}
@@ -688,9 +696,19 @@ $("cfgTestAdmin").onclick = async ()=>{
     saveCfg();
     const ac = adminCfgFromForm();
     const { fingerprint } = derivedAdminPubFingerprint(normalizeSeed(ac.adminSeed));
-    await api("/admin/pllm-tokens/issuers", { auth: "admin" });
+    const data = await api("/admin/pllm-tokens/issuers", { auth: "admin" });
+    const row = ((data && data.items) || []).find(
+      (x) => x.issuer_id === ac.adminIssuer && x.key_id === ac.adminKeyId && x.is_active
+    );
+    if (!row) throw new Error(`库里无启用的 ${ac.adminIssuer}/${ac.adminKeyId}`);
+    const regFp = row.public_key_fingerprint || "";
+    if (regFp && fingerprint !== regFp) {
+      throw new Error(
+        `私钥与库里 ${ac.adminIssuer}/${ac.adminKeyId} 不匹配：派生指纹 ${fingerprint}，库里 ${regFp}（local-test 应为 4519a93ef24ad30c）`
+      );
+    }
     $("cfgStatus").textContent =
-      `Ed25519 验签通过 ✓ ${ac.adminIssuer}/${ac.adminKeyId} · 派生公钥指纹 ${fingerprint}（须与签发者列表一致）`;
+      `Ed25519 验签通过 ✓ ${ac.adminIssuer}/${ac.adminKeyId} · 派生公钥指纹 ${fingerprint}（与签发者列表一致）`;
   } catch (e) {
     $("cfgStatus").textContent = "Ed25519 验签失败: " + e.message;
   }
