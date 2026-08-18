@@ -147,23 +147,24 @@
       </div>
       <div class="field">
         <label>Ed25519 签发者（模型/Token 管理签名用）</label>
-        <input id="cfgAdminIssuer" type="text" placeholder="issuer_id，如 panr" />
+        <input id="cfgAdminIssuer" type="text" placeholder="必须与已登记一致，如 local-test" />
       </div>
       <div class="field">
         <label>key_id（密钥版本）</label>
-        <input id="cfgAdminKeyId" type="text" placeholder="如 key-2026" />
+        <input id="cfgAdminKeyId" type="text" placeholder="必须与已登记一致，如 key-2026" />
       </div>
       <div class="field">
         <label>管理员私钥 seed（hex，Ed25519 签名）</label>
-        <input id="cfgAdminSeed" type="password" placeholder="generate 返回的 64 hex 私钥，仅存本地" />
+        <input id="cfgAdminSeed" type="password" placeholder="对应私钥 64 hex，须与上面 issuer 成对" />
       </div>
     </div>
     <div class="cfg-actions">
       <button class="primary" id="cfgSave">保存配置</button>
       <button id="cfgTest">测试连接 (/health)</button>
+      <button id="cfgTestAdmin">测试 Ed25519 签名</button>
       <span id="cfgStatus" class="meta"></span>
     </div>
-    <div class="hint">说明：模型/Token/签发者管理接口 (/admin/models、/admin/pllm-tokens) 用 Ed25519 签名（需在下方配置签发者 + 私钥 seed）；对话 (/v1/chat/completions) 用 PLLM Token；系统资源 (/admin/dashboard/snapshot) 用 Dashboard Token。</div>
+    <div class="hint">说明：模型/Token 管理用 Ed25519 签名。issuer_id、key_id、私钥必须是同一对（例如已登记的 local-test / key-2026）。填完务必点「保存配置」，否则会沿用旧值，出现 Signature verification failed。对话用 PLLM Token；系统资源用 Dashboard Token。</div>
   </div>
 
   <nav class="tabs">
@@ -407,6 +408,7 @@
     <input id="addIssuerId" type="text" placeholder="例如 my-cli / panr" />
     <label>key_id（必填，密钥版本）</label>
     <input id="addKeyId" type="text" placeholder="例如 key-2026" />
+    <div class="hint">这是<strong>新签发者</strong>的 key_id，与连接配置里用于签名的 key_id 无关。</div>
     <label>public_key（可选，支持 64 hex / Base64 DER / OpenSSH；留空 = 服务端生成密钥对）</label>
     <input id="addPub" type="text" placeholder="64 hex 裸公钥，或 MCow…= 的 Base64，或 ssh-ed25519 AAAA…；留空则由服务端生成" />
     <label style="display:flex; align-items:center; gap:8px; margin-top:12px;">
@@ -523,13 +525,14 @@ function initLogin(){
   setTimeout(()=>input.focus(),50);
 }
 const DEFAULT_DTOKEN = "pllm_dash_sTq2jdQERFiZF9PWZgVIMxCenXW6jiCI"; // 内网默认仪表盘令牌，可在配置里覆盖
+const SIGN_AUDIENCE = "aitube-pllm"; // 须与后端 settings.audience 一致
 function cfg(){
   return {
     base: (localStorage.getItem(LS.base) || "http://35.76.187.215:8080").replace(/\/+$/,""),
     token: localStorage.getItem(LS.token) || "",
     dtoken: localStorage.getItem(LS.dtoken) || DEFAULT_DTOKEN,
-    adminIssuer: localStorage.getItem(LS.adminIssuer) || "panr",
-    adminKeyId: localStorage.getItem(LS.adminKeyId) || "key-2026",
+    adminIssuer: localStorage.getItem(LS.adminIssuer) || "",
+    adminKeyId: localStorage.getItem(LS.adminKeyId) || "",
     adminSeed: localStorage.getItem(LS.adminSeed) || ""
   };
 }
@@ -537,8 +540,8 @@ function loadCfgInputs(){
   document.getElementById("cfgBase").value = localStorage.getItem(LS.base) || "http://35.76.187.215:8080";
   document.getElementById("cfgToken").value = localStorage.getItem(LS.token) || "";
   document.getElementById("cfgDToken").value = localStorage.getItem(LS.dtoken) || DEFAULT_DTOKEN;
-  document.getElementById("cfgAdminIssuer").value = localStorage.getItem(LS.adminIssuer) || "panr";
-  document.getElementById("cfgAdminKeyId").value = localStorage.getItem(LS.adminKeyId) || "key-2026";
+  document.getElementById("cfgAdminIssuer").value = localStorage.getItem(LS.adminIssuer) || "";
+  document.getElementById("cfgAdminKeyId").value = localStorage.getItem(LS.adminKeyId) || "";
   document.getElementById("cfgAdminSeed").value = localStorage.getItem(LS.adminSeed) || "";
 }
 function saveCfg(){
@@ -547,29 +550,72 @@ function saveCfg(){
   localStorage.setItem(LS.dtoken, document.getElementById("cfgDToken").value.trim());
   localStorage.setItem(LS.adminIssuer, document.getElementById("cfgAdminIssuer").value.trim());
   localStorage.setItem(LS.adminKeyId, document.getElementById("cfgAdminKeyId").value.trim());
-  localStorage.setItem(LS.adminSeed, document.getElementById("cfgAdminSeed").value.trim());
+  // 私钥 seed 去掉所有空白，避免粘贴时夹带换行导致验签失败
+  const seedRaw = document.getElementById("cfgAdminSeed").value;
+  localStorage.setItem(LS.adminSeed, String(seedRaw || "").replace(/\s+/g, "").toLowerCase());
 }
 
-// ---- Ed25519 签名（管理接口 /admin/models、/admin/pllm-tokens 用）----
-const SIGN_AUDIENCE = "aitube-pllm"; // 与后端 settings.audience 一致
+function adminCfgFromForm(){
+  const issuer = (document.getElementById("cfgAdminIssuer")?.value || "").trim();
+  const keyId = (document.getElementById("cfgAdminKeyId")?.value || "").trim();
+  const seedRaw = String(document.getElementById("cfgAdminSeed")?.value || "").replace(/\s+/g, "").toLowerCase();
+  if (issuer && keyId && seedRaw) return { adminIssuer: issuer, adminKeyId: keyId, adminSeed: seedRaw };
+  const c = cfg();
+  return {
+    adminIssuer: (c.adminIssuer || "").trim(),
+    adminKeyId: (c.adminKeyId || "").trim(),
+    adminSeed: String(c.adminSeed || "").replace(/\s+/g, "").toLowerCase(),
+  };
+}
+function apiBase(){
+  const v = (document.getElementById("cfgBase")?.value || "").trim();
+  return (v || cfg().base).replace(/\/+$/,"");
+}
+async function derivedAdminPubFingerprint(seedHex){
+  const seed = normalizeSeed(seedHex);
+  const bytes = new Uint8Array(seed.match(/.{2}/g).map(h => parseInt(h, 16)));
+  const kp = nacl.sign.keyPair.fromSeed(bytes);
+  const pubHex = Array.from(kp.publicKey).map(b => b.toString(16).padStart(2, "0")).join("");
+  const fpFull = await sha256HexBytes(new TextEncoder().encode(pubHex));
+  return { pubHex, fingerprint: fpFull.slice(0, 16) };
+}
+
+function normalizeSeed(seedHex){
+  const s = String(seedHex || "").replace(/\s+/g, "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(s)) throw new Error("私钥 seed 必须是 64 位 hex，且与 issuer_id/key_id 是同一对密钥");
+  return s;
+}
+function utcTimestamp(){
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getUTCFullYear() + "-" + p(d.getUTCMonth()+1) + "-" + p(d.getUTCDate())
+    + "T" + p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds()) + "+00:00";
+}
+async function sha256HexBytes(bytes){
+  const buf = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
 function edSign(seedHex, msgBytes){
   const seed = new Uint8Array(seedHex.match(/.{2}/g).map(h => parseInt(h, 16)));
   const kp = nacl.sign.keyPair.fromSeed(seed);
   const sig = nacl.sign.detached(msgBytes, kp.secretKey);
   return Array.from(sig).map(b => b.toString(16).padStart(2, '0')).join('');
 }
-function signHeaders(method, path, bodyObj){
-  const c = cfg();
-  if(!c.adminSeed) throw new Error("未配置管理员私钥 seed（配置 → 模型管理鉴权）");
+async function signHeaders(method, path, bodyObj){
+  const ac = adminCfgFromForm();
+  if (!ac.adminIssuer || !ac.adminKeyId) throw new Error("未配置 Ed25519 签发者 / key_id（连接配置里填写并保存）");
+  if (!ac.adminSeed) throw new Error("未配置管理员私钥 seed（连接配置里填写并保存）");
+  const seed = normalizeSeed(ac.adminSeed);
   const timestamp = new Date().toISOString();
   const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b=>b.toString(16).padStart(2,'0')).join('');
   const bodyStr = bodyObj ? JSON.stringify(bodyObj) : "";
-  const bodyHash = sha256(unescape(encodeURIComponent(bodyStr))); // UTF-8 字节 sha256，对齐后端 hashlib.sha256(body)
+  // 与后端 hashlib.sha256(body) 对齐（UTF-8 字节）
+  const bodyHash = sha256(unescape(encodeURIComponent(bodyStr)));
   const content = method + "\n" + path + "\n" + SIGN_AUDIENCE + "\n" + timestamp + "\n" + nonce + "\n" + bodyHash;
-  const sig = edSign(c.adminSeed, new TextEncoder().encode(content));
+  const sig = edSign(seed, new TextEncoder().encode(content));
   return {
-    "x-issuer-id": c.adminIssuer,
-    "x-key-id": c.adminKeyId,
+    "x-issuer-id": ac.adminIssuer,
+    "x-key-id": ac.adminKeyId,
     "x-audience": SIGN_AUDIENCE,
     "x-timestamp": timestamp,
     "x-nonce": nonce,
@@ -578,13 +624,16 @@ function signHeaders(method, path, bodyObj){
 }
 
 async function api(path, opts={}){
+  // 管理接口签名直接读表单；发起前同步 localStorage，避免「填了没点保存」
+  if (opts.auth === "admin") saveCfg();
   const c = cfg();
+  const base = apiBase();
   const method = opts.method || "GET";
   const headers = { "Content-Type":"application/json" };
-  if (opts.auth === "admin") Object.assign(headers, signHeaders(method, path, opts.body));
+  if (opts.auth === "admin") Object.assign(headers, await signHeaders(method, path, opts.body));
   else if (opts.auth === "bearer") headers["Authorization"] = "Bearer " + c.token;
   else if (opts.auth === "dash") headers["X-Dashboard-Token"] = c.dtoken;
-  const res = await fetch(c.base + path, {
+  const res = await fetch(base + path, {
     method,
     headers,
     body: opts.body ? JSON.stringify(opts.body) : undefined
@@ -592,6 +641,15 @@ async function api(path, opts={}){
   if (!res.ok){
     let msg = "HTTP " + res.status;
     try { const j = await res.json(); if (j && j.detail) msg = (Array.isArray(j.detail)? j.detail.map(x=>x.msg||x).join("; ") : j.detail); } catch(e){}
+    if (String(msg).toLowerCase().includes("signature verification failed")) {
+      msg += "（连接配置里的 issuer_id + key_id + 私钥 seed 必须与库里 local-test 成对；私钥填 c1b66bda… 不是公钥 aa775ce8… 或 MCow…=）";
+    }
+    if (String(msg).includes("Issuer not found or inactive")) {
+      msg += "（x-key-id 必须与库里该 issuer 的 key_id 完全一致，local-test 应为 key-2026）";
+    }
+    if (String(msg).includes("localhost CLI")) {
+      msg += "（签名已通过，但线上后端仍是旧版 x-local-admin 校验，需要部署最新代码）";
+    }
     throw new Error(msg);
   }
   if (res.status === 204) return null;
@@ -626,6 +684,19 @@ $("cfgTest").onclick = async ()=>{
   $("cfgStatus").textContent = "测试中…";
   try { const r = await api("/health"); $("cfgStatus").textContent = "连接成功: " + (r&&r.status||"ok") + " ✓"; }
   catch(e){ $("cfgStatus").textContent = "连接失败: " + e.message; }
+};
+$("cfgTestAdmin").onclick = async ()=>{
+  $("cfgStatus").textContent = "Ed25519 验签测试中…";
+  try {
+    saveCfg();
+    const ac = adminCfgFromForm();
+    const { fingerprint } = await derivedAdminPubFingerprint(normalizeSeed(ac.adminSeed));
+    await api("/admin/pllm-tokens/issuers", { auth: "admin" });
+    $("cfgStatus").textContent =
+      `Ed25519 验签通过 ✓ ${ac.adminIssuer}/${ac.adminKeyId} · 派生公钥指纹 ${fingerprint}（须与签发者列表一致）`;
+  } catch (e) {
+    $("cfgStatus").textContent = "Ed25519 验签失败: " + e.message;
+  }
 };
 
 // ---------- 状态 ----------
