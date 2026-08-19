@@ -112,6 +112,14 @@ class Settings(BaseSettings):
         default=600.0,
         description="非流式请求经队列转发的总超时(秒)，超时返回 504",
     )
+    queue_tier_think_token_budget: dict = Field(
+        default_factory=lambda: {"high": -1, "medium": 256, "low": 0},
+        description=(
+            "软降级后按挡位改写 vLLM thinking_token_budget。"
+            "-1=不改写客户端思考设置；0=关闭 thinking；正整数=思考 token 硬上限。"
+            "Qwen3.8-27B 本地模板没有 thinking_budget，必须用 thinking_token_budget。"
+        ),
+    )
 
     # LiteLLM admin 配置（用于启动时动态注入外部模型）
     litellm_admin_url: str = Field(

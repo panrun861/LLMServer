@@ -207,7 +207,7 @@
           </div>
         </div>
         <div class="panel">
-          <h2>队列路由（三级挡位 / 每模型并发 / 半限降级）</h2>
+          <h2>队列路由（三级挡位 / 每模型并发 / 半限降级改 think budget）</h2>
           <div id="queueMsg" class="meta">队列未启用或未加载。</div>
           <div id="queueKpis" class="row" style="margin-top:12px;"></div>
           <div class="scroll"><table id="queueTable"></table></div>
@@ -815,19 +815,25 @@ function renderQueue(q){
     $("queueTable").innerHTML = "";
     return;
   }
-  $("queueMsg").textContent = "默认模型：" + esc(q.default_model || "–");
+  $("queueMsg").textContent = "默认模型：" + esc(q.default_model || "–")
+    + " · 降级改 think budget（high 不改写 / medium 硬帽 / low 关思考）";
   const tiers = q.tiers || {};
   const order = ["high","medium","low"];
+  const thinkLabel = (v)=>{
+    if (v==null || v<0) return "不改写";
+    if (v===0) return "关闭思考";
+    return v + " token";
+  };
   let kpis = "";
   order.forEach(t=>{
     const t0 = tiers[t] || {};
     const pct = t0.limit ? Math.round((t0.active/t0.limit)*100) : 0;
     kpis += `<div class="kpi"><div class="label">${t.toUpperCase()} 挡位</div>
       <div class="value">${t0.active}/${t0.limit}</div>
-      <div class="meta">排队 ${t0.queued} · 并发 ${pct}%</div></div>`;
+      <div class="meta">排队 ${t0.queued} · think ${thinkLabel(t0.think_token_budget)} · 并发 ${pct}%</div></div>`;
   });
   $("queueKpis").innerHTML = kpis;
-  let html = `<tr><th>挡位</th><th>排队</th><th>占用</th><th>上限</th><th>可用模型</th></tr>`;
+  let html = `<tr><th>挡位</th><th>排队</th><th>占用</th><th>上限</th><th>think 预算</th><th>可用模型</th></tr>`;
   order.forEach(t=>{
     const t0 = tiers[t] || {};
     html += `<tr>
@@ -835,6 +841,7 @@ function renderQueue(q){
       <td>${t0.queued!=null?t0.queued:"–"}</td>
       <td>${t0.active!=null?t0.active:"–"}</td>
       <td>${t0.limit!=null?t0.limit:"–"}</td>
+      <td>${thinkLabel(t0.think_token_budget)}</td>
       <td class="wrap2">${(t0.models||[]).map(esc).join("、")||"–"}</td></tr>`;
   });
   $("queueTable").innerHTML = html;

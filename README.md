@@ -31,8 +31,9 @@ monitoring (/admin/dashboard/*) : Dashboard Token
 Each model carries a `tier` (high / medium / low). Requests are routed to that tier's queue;
 each tier has its own `asyncio.Queue` and every model has its own `asyncio.Semaphore`
 concurrency gate (`models.runtime_params.concurrency`). Waiting past half of a tier's
-`wait_limit` triggers a soft-degrade to the next tier; the lowest tier hard-times-out at
-`wait_limit` → 504. See `docs/tier-queue-routing-design.md`.
+`wait_limit` triggers a soft-degrade to the next tier **and compresses think
+budget** (`thinking_token_budget`: medium cap, low = off); the lowest tier
+hard-times-out at `wait_limit` → 504. See `docs/tier-queue-routing-design.md`.
 
 Enable with `PLLM_QUEUE_ENABLED=true`. After any model add/remove/change, call
 `POST /admin/queue/reload` so the router rebuilds its gates.

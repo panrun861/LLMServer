@@ -180,33 +180,84 @@ async def _get_existing_models(client: httpx.AsyncClient, admin_url: str) -> lis
     return []
 
 
+def _entry_id(entry: dict) -> str | None:
+    """LiteLLM ``/model/info`` 把条目 id 放在 ``model_info.id``。"""
+    mid = (entry.get("model_info") or {}).get("id")
+    return str(mid) if mid else None
+
+
+def _matches_payload(entry: dict, model_name: str, payload: dict) -> bool:
+    """同名且 litellm model + api_base 完全一致。"""
+    if entry.get("model_name") != model_name:
+        return False
+    lp = entry.get("litellm_params", {}) or {}
+    want = payload["litellm_params"]
+    return lp.get("model") == want.get("model") and lp.get("api_base") == want.get("api_base")
+
+
 def _already_registered(
     existing: list[dict], model_name: str, payload: dict
 ) -> bool:
-    """判断 payload 描述的模型是否已在 LiteLLM 中按相同 model+api_base 注册。
+    """判断 payload 描述的模型是否已在 LiteLLM 中按相同 model+api_base 注册。"""
+    return any(_matches_payload(e, model_name, payload) for e in existing)
 
-    注：LiteLLM 1.92 的 ``/model/delete`` 必须传 ``id``（``model_name`` 会 422），
-    而 ``/model/info`` 又不返回 ``id``，因此无法可靠地按 id 删除。改用幂等策略：
-    若已存在完全匹配（model_name + litellm_params.model + api_base）的条目则跳过注册，
-    避免每次重启累加重复/错误条目。
+
+async def _delete_stale_same_name_entries(
+    client: httpx.AsyncClient,
+    admin_url: str,
+    existing: list[dict],
+    model_name: str,
+    payload: dict,
+) -> list[dict]:
+    """删掉同名但 api_base/artifact 已过期的 LiteLLM 条目，避免被当成 model group 负载均衡。
+
+    历史原因：启动注入曾只「完全匹配则跳过」，改 vLLM 地址后旧条目（如
+    ``host.docker.internal:8000``）会留下来，LiteLLM 在死地址和 ``vllm:8000`` 之间轮询，
+    约一半请求 500。
     """
-    want_model = payload["litellm_params"].get("model")
-    want_base = payload["litellm_params"].get("api_base")
-    for e in existing:
-        if e.get("model_name") != model_name:
+    kept: list[dict] = []
+    for entry in existing:
+        if entry.get("model_name") != model_name:
+            kept.append(entry)
             continue
-        lp = e.get("litellm_params", {}) or {}
-        if lp.get("model") == want_model and lp.get("api_base") == want_base:
-            return True
-    return False
+        if _matches_payload(entry, model_name, payload):
+            kept.append(entry)
+            continue
+        mid = _entry_id(entry)
+        if not mid:
+            kept.append(entry)
+            continue
+        try:
+            resp = await client.post(
+                f"{admin_url}/model/delete",
+                json={"id": mid},
+                headers=_auth_header(),
+            )
+            if resp.status_code in (200, 201, 404):
+                logger.info(
+                    "删除 LiteLLM 过期条目: %s id=%s api_base=%s",
+                    model_name,
+                    mid,
+                    (entry.get("litellm_params") or {}).get("api_base", ""),
+                )
+            else:
+                logger.warning(
+                    "删除 LiteLLM 过期条目失败 %s id=%s: %s %s",
+                    model_name, mid, resp.status_code, resp.text[:200],
+                )
+                kept.append(entry)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("删除 LiteLLM 过期条目异常 %s id=%s: %s", model_name, mid, exc)
+            kept.append(entry)
+    return kept
 
 
 async def inject_models_to_litellm() -> dict[str, Any]:
     """启动注入：读取所有已登记模型 → 解密 → 逐模型 POST /model/new 注册。
 
     LiteLLM 1.92 的 /config/update 硬编码禁止 model_list，因此改用单模型端点
-    /model/new（需 STORE_MODEL_IN_DB=True 持久化到 LiteLLM DB）。每个模型注册前
-    先 DELETE 同名 DB 记录以保证幂等。
+    /model/new（需 STORE_MODEL_IN_DB=True 持久化到 LiteLLM DB）。每个模型先删掉
+    同名但 api_base/artifact 不一致的过期条目，再按完全匹配跳过或 /model/new。
 
     返回注入结果摘要。
     """
@@ -230,6 +281,9 @@ async def inject_models_to_litellm() -> dict[str, Any]:
                 summary["skipped"] += 1
                 continue
             payload = _model_new_payload(m)
+            existing = await _delete_stale_same_name_entries(
+                client, admin_url, existing, m["model_name"], payload,
+            )
             # 幂等：已存在完全相同的条目则跳过，避免重复/错误注册累加
             if _already_registered(existing, m["model_name"], payload):
                 summary["skipped"] += 1
@@ -246,6 +300,10 @@ async def inject_models_to_litellm() -> dict[str, Any]:
                 )
                 if resp.status_code in (200, 201):
                     summary["injected"] += 1
+                    existing.append({
+                        "model_name": m["model_name"],
+                        "litellm_params": payload["litellm_params"],
+                    })
                     logger.info(
                         "LiteLLM 注册模型成功: %s -> %s api_base=%s",
                         m["model_name"], payload["litellm_params"]["model"],

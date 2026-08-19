@@ -8,8 +8,9 @@
 - 每挡位一个常驻 worker 协程，从本挡位队列取请求 → 取「最空闲兄弟模型」的并发闸 → 转发。
 - **半限软降级**：请求等待时间 ``waited`` 在非最低挡位且
   ``waited > wait_limit × degrade_threshold_ratio``（默认½）仍拿不到槽位 →
-  转移到下一挡位队列尾部（保留 enqueued_at，总等待连续累计）。最低挡位仍超
-  ``wait_limit``（硬超时）→ 504。
+  转移到下一挡位队列尾部（保留 enqueued_at，总等待连续累计），并按目标挡位
+  **压缩 think budget**（medium 硬帽 ``thinking_token_budget``，low 关闭思考）。
+  最低挡位仍超 ``wait_limit``（硬超时）→ 504。
 
 转发动作本身**不在此模块实现**，而是通过 ``queue_router.forward_fn`` 回调注入
 （由 ``inference_gateway`` 注册），以避免与网关模块形成循环依赖。
@@ -33,6 +34,85 @@ _NEXT_TIER = {"high": "medium", "medium": "low", "low": None}
 
 # 流式转发时，worker 向 item.stream_q 推送的结束哨兵
 STREAM_SENTINEL = object()
+
+# OpenAI 风格 thinking 对象会在本栈 LiteLLM 上 500；降级时改写为 vLLM 硬帽。
+_THINKING_ON_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def _as_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _chat_template_kwargs(request_body: dict) -> dict:
+    kwargs = request_body.get("chat_template_kwargs")
+    return dict(kwargs) if isinstance(kwargs, dict) else {}
+
+
+def _thinking_requested(request_body: dict) -> bool:
+    """客户端是否意图开思考（含本栈无效的顶层 enable_thinking）。"""
+    kwargs = _chat_template_kwargs(request_body)
+    if kwargs.get("enable_thinking") is True:
+        return True
+    if request_body.get("enable_thinking") is True:
+        return True
+    thinking = request_body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        return True
+    if _as_int(request_body.get("thinking_token_budget")) is not None:
+        return True
+    effort = request_body.get("reasoning_effort") or kwargs.get("reasoning_effort")
+    return isinstance(effort, str) and effort.lower() in _THINKING_ON_EFFORTS
+
+
+def apply_think_budget(
+    request_body: dict,
+    tier: str,
+    *,
+    caps: Optional[dict] = None,
+) -> str:
+    """按挡位改写请求体中的思考预算（原地修改 ``request_body``）。
+
+    Qwen3.8-27B 本地 chat template **没有** ``thinking_budget``；有效硬帽是
+    vLLM 的 ``thinking_token_budget``。开思考必须写
+    ``chat_template_kwargs.enable_thinking``。
+
+    返回用于日志的短动作描述。
+    """
+    policy = caps if caps is not None else settings.queue_tier_think_token_budget
+    cap = _as_int((policy or {}).get(tier, -1))
+    if cap is None:
+        cap = -1
+
+    if cap < 0:
+        return "unchanged"
+
+    kwargs = _chat_template_kwargs(request_body)
+    wanted = _thinking_requested(request_body)
+
+    if cap == 0:
+        kwargs["enable_thinking"] = False
+        request_body["chat_template_kwargs"] = kwargs
+        request_body["enable_thinking"] = False
+        request_body.pop("thinking_token_budget", None)
+        request_body.pop("thinking_budget", None)
+        request_body.pop("thinking", None)
+        return "disable"
+
+    existing = _as_int(request_body.get("thinking_token_budget"))
+    request_body["thinking_token_budget"] = (
+        cap if existing is None else min(existing, cap)
+    )
+    request_body.pop("thinking", None)
+    request_body.pop("thinking_budget", None)
+    if wanted:
+        kwargs["enable_thinking"] = True
+        request_body["chat_template_kwargs"] = kwargs
+    return f"cap:{request_body['thinking_token_budget']}"
 
 
 class QueueItem:
@@ -262,14 +342,16 @@ class QueueRouter:
             sem.release()
 
     def _requeue(self, item: QueueItem, next_tier: str) -> None:
+        from_tier = item.current_tier
         item.current_tier = next_tier
+        think_action = apply_think_budget(item.request_body, next_tier)
         picked = self._pick_model(next_tier)
         if picked:
             item.target_model = picked
         self.queues[next_tier].put_nowait(item)
         logger.info(
-            "请求 %s 在 %s 等待过久，软降级到 %s (target=%s)",
-            item.request_id, item.current_tier, next_tier, item.target_model,
+            "请求 %s 在 %s 等待过久，软降级到 %s (target=%s, think=%s)",
+            item.request_id, from_tier, next_tier, item.target_model, think_action,
         )
 
     def _fail(self, item: QueueItem, status_code: int, detail: str) -> None:
@@ -293,15 +375,20 @@ class QueueRouter:
         tiers: dict[str, dict] = {}
         for t in TIERS:
             models = self.tier_models.get(t) or []
+            think_cap = _as_int((settings.queue_tier_think_token_budget or {}).get(t, -1))
+            if think_cap is None:
+                think_cap = -1
             tiers[t] = {
                 "queued": self.queues[t].qsize(),
                 "active": self.active[t],
                 "limit": sum(self.caps.get(m, 0) for m in models),
                 "models": models,
+                "think_token_budget": think_cap,
             }
         return {
             "queue_enabled": settings.queue_enabled,
             "default_model": self.default_model,
+            "think_budget": settings.queue_tier_think_token_budget,
             "tiers": tiers,
         }
 

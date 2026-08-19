@@ -1,6 +1,6 @@
 # PLLM 模型分级队列路由设计（高/中/低三级）
 
-> 状态：v2.1 已实现（v2 于 2026-08-14 落地 `src/aitube_pllm/core/queue.py` + `inference_gateway.py` 接入 + `/admin/queue/status`；v2.1 于同日修复并发派发串行化瓶颈，见 §13）
+> 状态：v2.2 已实现（v2 于 2026-08-14 落地 `src/aitube_pllm/core/queue.py` + `inference_gateway.py` 接入 + `/admin/queue/status`；v2.1 于同日修复并发派发串行化瓶颈，见 §13；v2.2 软降级改写 think budget，见 §3）
 > 关联：旧方案 `docs/multilevel-queue-plan.md`（按「请求难度」分级）与本方案（按「模型等级」分级）是两个不同维度，本方案取代前者作为主路径。
 > 变更：v2 将 v1 的"固定 10 分钟超时降级"升级为**每挡位独立 wait_limit + 超过½即软降级**；并发数改为每模型独立（存 `runtime_params.concurrency`，免 DB 迁移）。
 > 变更(v2.1)：worker 内 `await forward_fn`（整条 httpx 往返阻塞 worker）重构为 `_dispatch` 拿槽位后 `create_task(_forward_then_release)` 后台并发转发，使每挡位真实并发 = `Semaphore(N)`（修复前实际并发恒=1）。
@@ -48,6 +48,20 @@
 3. **挡位内最空闲兄弟模型**：同一挡位挂多个模型时，worker 优先挑选「**剩余并发槽位最多**」的模型（而非永远钉死 current），实现挡位内的负载均衡。
 
 > 示例数值（默认）：high `wait_limit=60s` → 软降级阈值 **30s**；medium `120s` → **60s**；low `300s` → **150s**。请求在 high 等 >30s 即尝试 medium；medium 等 >60s 即尝试 low；low 等 >150s → 504。
+
+### 降级后改 think budget（v2.2）
+
+半限软降级**不只换挡位/模型**，同时按**目标挡位**改写思考预算。入队当时不改客户端设置；只有 `_requeue` 时才改。
+
+本栈 Qwen3.8-27B 的 chat template **没有** `thinking_budget`；顶层 `enable_thinking` 也打不开思考。有效开关是 `chat_template_kwargs.enable_thinking`，有效硬帽是 vLLM `thinking_token_budget`。`thinking: {budget_tokens:N}` 会 500，降级时会剥掉并改写成硬帽。
+
+| 降到挡位 | 默认策略 | 请求体改写 |
+|---|---|---|
+| high | `-1` 不改写 | 保持客户端 think 设置 |
+| medium | `256` 部分压缩 | 写入 `thinking_token_budget=min(客户端, 256)`；若客户端本意开思考，补上 `chat_template_kwargs.enable_thinking=true` |
+| low | `0` 全部关掉 | `enable_thinking=false` + 去掉 budget |
+
+配置：`PLLM_QUEUE_TIER_THINK_TOKEN_BUDGET`（JSON，如 `{"high":-1,"medium":256,"low":0}`）。客户端已经更小的 budget 不会被抬高。未开思考的请求降级后硬帽是空操作。
 
 ### 降级后用什么模型
 
@@ -109,6 +123,7 @@ async def worker(level):
 | `queue_tier_wait_limit_seconds` | `{"high":60,"medium":120,"low":300}` | **每挡位最大等待时间(秒)**，半限软降级与硬超时都基于它 |
 | `queue_degrade_threshold_ratio` | `0.5` | 半限降级比例：等待超过 `wait_limit × 该值` 即降级到下一挡位 |
 | `queue_http_timeout_seconds` | `600` | 非流式请求转发给上游的总超时(秒)，超时返回 504 |
+| `queue_tier_think_token_budget` | `{"high":-1,"medium":256,"low":0}` | 软降级后的 think 硬帽：`-1` 不改写，`0` 关思考，正整数 = `thinking_token_budget` |
 
 > 并发数 `concurrency` 存于 `models.runtime_params.concurrency`（JSON），**无需新增 DB 列 / 迁移**；模型管理 API 在 `runtime_params` 里写入即可。每次模型增删改后调用 `POST /admin/queue/reload` 让路由重新加载并发闸。
 
